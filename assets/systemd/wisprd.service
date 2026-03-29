@@ -1,0 +1,12 @@
+[Unit]
+Description=Wispr Dictation Daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wisprd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

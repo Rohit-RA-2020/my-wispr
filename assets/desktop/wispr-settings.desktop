@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wispr Settings
+Comment=Configure Wispr dictation
+Exec=wispr-settings
+Categories=Utility;Accessibility;
+Terminal=false
+
