@@ -1,6 +1,6 @@
 # Wispr
 
-Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions instead of literal text.
+Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, or formatted text instead of literal text.
 
 This repository currently targets Ubuntu GNOME on Wayland.
 
@@ -14,7 +14,7 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - direct typing uses `/dev/uinput`
 - live capture currently uses `pw-record` for the audio stream and GStreamer only for device enumeration
 - finalized transcript segments can be passed through an OpenAI-compatible `responses` backend for structured command interpretation
-- the LLM layer supports literal dictation, editing actions, and literal text plus actions in the same spoken segment
+- the LLM layer supports literal dictation, editing actions, semantic commands, block formatting, and literal text plus actions in the same spoken segment
 
 ## Capabilities
 
@@ -23,9 +23,13 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - Deepgram speech-to-text streaming
 - OpenAI-compatible command interpretation with configurable base URL, model, and API key
 - spoken editing commands such as `hello enter`, `select all`, `copy`, `paste`, `undo`, and `redo`
+- dynamic spoken shortcuts such as `press control t`, `press control shift p`, `press alt tab`, and `press super left`
+- semantic spoken commands such as `open a new browser tab`, `close this tab`, `focus the address bar`, `save file`, and `refresh this page`
+- GNOME-aware app context detection so semantic commands can resolve differently in browsers versus generic apps
 - repeated key actions such as `press space key twice`
 - function key actions such as `press the F5 key`
 - shell-style text cleanup for command dictation, for example `flutter dash dash version enter` becoming `flutter --version` followed by `Enter`
+- intelligent list formatting and block rewrites for structured dictation such as to-do lists with spoken corrections
 
 ## Workspace Layout
 
@@ -143,9 +147,14 @@ command_mode = "always_infer"
 text_output_mode = "literal"
 action_scope = "editing_only"
 debug_overlay = true
+dynamic_shortcuts_enabled = true
+semantic_commands_enabled = true
+shortcut_denylist_profile = "minimal"
+shortcut_allowlist = []
+shortcut_denylist = []
 ```
 
-The LLM API key is stored separately in GNOME Secret Service. The settings UI includes a `Test LLM` button, and the CLI exposes a direct interpreter test command.
+The LLM API key is stored separately in GNOME Secret Service. The settings UI includes a `Test LLM` button plus controls for dynamic shortcuts, semantic commands, denylist profile, and optional allowlist or denylist overrides. The CLI also exposes direct interpreter test commands.
 
 ## Day-To-Day Use
 
@@ -163,6 +172,8 @@ Other useful commands:
 ~/.local/bin/wisprctl status
 ~/.local/bin/wisprctl open-settings
 ~/.local/bin/wisprctl test-llm "hello enter"
+~/.local/bin/wisprctl test-llm "press control t"
+~/.local/bin/wisprctl test-llm --app-class browser "open a new browser tab"
 ```
 
 ## Intelligent Commands
@@ -171,11 +182,32 @@ Examples of phrases that Wispr can now interpret:
 
 - `hello enter` -> types `hello` and presses `Enter`
 - `select all` -> sends `Ctrl+A`
+- `press control t` -> sends `Ctrl+T`
+- `press control shift p` -> sends `Ctrl+Shift+P`
+- `press alt tab` -> sends `Alt+Tab`
+- `press super left` -> sends `Super+Left`
 - `press space key twice` -> presses `Space` twice
 - `press the F5 key` -> presses `F5`
 - `flutter dash dash version enter` -> types `flutter --version` and presses `Enter`
+- `open a new browser tab` -> resolves to `Ctrl+T` in browser context
+- `close this tab` -> resolves to `Ctrl+W`
+- `reopen the last closed tab` -> resolves to `Ctrl+Shift+T`
+- `focus the address bar` -> resolves to `Ctrl+L`
+- `save file` -> resolves to `Ctrl+S`
 
-The LLM layer is constrained to editing-oriented actions only. It does not launch apps, run shell commands itself, click the mouse, or send arbitrary shortcuts.
+## Intelligent Formatting
+
+Wispr can also rewrite the current dictation block when the spoken structure is clear.
+
+Examples:
+
+- ordered list speech can become a numbered list automatically
+- spoken corrections like `wait, not housecleaning, washing of clothes instead` can rewrite only the current list block
+- plain prose stays literal when structure is not clear
+
+Formatted block rewrites are applied back into the focused editor through the same typing layer used for normal dictation.
+
+The LLM layer is constrained to text formatting plus keyboard-driven actions only. It does not launch apps, run shell commands itself, click the mouse, or perform arbitrary desktop automation. Semantic commands are resolved into keyboard shortcuts, not direct system calls.
 
 ## Hotkey Behavior
 
@@ -221,7 +253,7 @@ systemctl --user status wisprd.service --no-pager
 journalctl --user -u wisprd.service -n 50 --no-pager
 ```
 
-The daemon status now includes LLM-related fields such as `intelligence_ready`, `llm_ready`, `last_llm_error`, `last_decision_kind`, and `intelligence_state`.
+The daemon status now includes LLM-related fields such as `intelligence_ready`, `llm_ready`, `last_llm_error`, `last_decision_kind`, `intelligence_state`, and may also show the detected active app plus the last resolved shortcut description.
 
 ### No typing
 
@@ -264,6 +296,8 @@ If Wispr keeps typing literal text for commands, check:
 ```bash
 ~/.local/bin/wisprctl status
 ~/.local/bin/wisprctl test-llm "select all"
+~/.local/bin/wisprctl test-llm "press control t"
+~/.local/bin/wisprctl test-llm --app-class browser "open a new browser tab"
 journalctl --user -u wisprd.service -n 50 --no-pager
 ```
 
@@ -273,10 +307,14 @@ Common causes:
 - incorrect LLM base URL or model
 - backend compatibility issues with the OpenAI-compatible `responses` API
 - a backend that rejects strict JSON schema output
+- a shortcut blocked by the built-in safety policy or your configured denylist
+- missing or wrong app context for a semantic command that depends on browser-style mappings
 
 ## Notes
 
 - the current Deepgram client uses the streaming listen endpoint and `nova-3`
 - the current capture path uses `pw-record` because it behaved more reliably on this machine than the earlier GStreamer live capture path
 - the LLM interpreter prefers streaming `responses` but falls back to a non-streaming `responses` request when a compatible backend closes the stream noisily
-- the daemon can press `Enter` or other supported keys only when the LLM interpreter explicitly returns those actions
+- the daemon can press dynamic modifier combinations with `Ctrl`, `Shift`, `Alt`, and `Super`
+- semantic commands currently cover common high-value app actions such as tab control, reload, find, save, copy, paste, undo, redo, and address-bar focus
+- a minimal built-in safety policy blocks clearly dangerous shortcuts such as `Ctrl+Alt+Delete` and `Super+L`
