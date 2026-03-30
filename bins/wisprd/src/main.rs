@@ -12,8 +12,9 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
 use wispr_core::{
-    AppConfig, DecisionKind, LlmInterpreter, Result, SegmentDecisionRequest, WisprError,
-    models::{DaemonStatus, DeviceChoice, DictationState},
+    AppConfig, CorrectionScope, DecisionKind, FormattingTriggerPolicy, LlmInterpreter,
+    PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
+    models::{DaemonStatus, DeviceChoice, DictationState, FormatKind},
     secrets::SecretStore,
     typing::{UInputKeyboard, diff_patch},
 };
@@ -31,6 +32,13 @@ struct AppState {
 
 struct RunningSession {
     stop_tx: oneshot::Sender<()>,
+}
+
+#[derive(Clone, Debug)]
+struct FormattingBlock {
+    raw_text: String,
+    rendered_text: String,
+    format_kind: FormatKind,
 }
 
 #[derive(Default)]
@@ -220,7 +228,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
 
     let state_for_task = state.clone();
     tokio::spawn(async move {
-        let mut committed_text = String::new();
+        let mut committed_prefix = String::new();
+        let mut active_block = None::<FormattingBlock>;
         let mut active_turn = String::new();
         let mut pending_audio = Vec::new();
         let mut logged_audio = false;
@@ -302,8 +311,10 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                     match event {
                         TranscriptEvent::Partial(chunk) => {
                             info!("deepgram partial: {}", chunk.text);
-                            let previous_rendered = render_transcript(&committed_text, &active_turn);
-                            let next_rendered = render_transcript(&committed_text, &chunk.text);
+                            let previous_rendered =
+                                render_transcript(&committed_prefix, active_block.as_ref(), &active_turn);
+                            let next_rendered =
+                                render_transcript(&committed_prefix, active_block.as_ref(), &chunk.text);
                             apply_transcript(
                                 &state_for_task,
                                 &mut keyboard,
@@ -324,7 +335,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 &config,
                                 &mut keyboard,
                                 &llm_interpreter,
-                                &mut committed_text,
+                                &mut committed_prefix,
+                                &mut active_block,
                                 &mut active_turn,
                                 chunk,
                             )
@@ -332,8 +344,14 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                         }
                         TranscriptEvent::TurnEnded => {
                             info!("deepgram turn ended");
-                            committed_text = append_turn(&committed_text, &active_turn);
-                            active_turn.clear();
+                            finalize_unresolved_turn(
+                                &state_for_task,
+                                &mut keyboard,
+                                &mut committed_prefix,
+                                &mut active_block,
+                                &mut active_turn,
+                            )
+                            .await;
                         }
                         TranscriptEvent::TurnEndedWithTranscript(chunk) => {
                             if processed_finals.insert(chunk.dedupe_key()) {
@@ -343,14 +361,21 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                     &config,
                                     &mut keyboard,
                                     &llm_interpreter,
-                                    &mut committed_text,
+                                    &mut committed_prefix,
+                                    &mut active_block,
                                     &mut active_turn,
                                     chunk,
                                 )
                                 .await;
                             } else {
-                                committed_text = append_turn(&committed_text, &active_turn);
-                                active_turn.clear();
+                                finalize_unresolved_turn(
+                                    &state_for_task,
+                                    &mut keyboard,
+                                    &mut committed_prefix,
+                                    &mut active_block,
+                                    &mut active_turn,
+                                )
+                                .await;
                             }
                         }
                         TranscriptEvent::Warning(message) => {
@@ -401,11 +426,12 @@ async fn process_finalized_segment(
     config: &AppConfig,
     keyboard: &mut UInputKeyboard,
     llm_interpreter: &Option<LlmInterpreter>,
-    committed_text: &mut String,
+    committed_prefix: &mut String,
+    active_block: &mut Option<FormattingBlock>,
     active_turn: &mut String,
     chunk: TranscriptChunk,
 ) {
-    let previous_rendered = render_transcript(committed_text, active_turn);
+    let previous_rendered = render_transcript(committed_prefix, active_block.as_ref(), active_turn);
 
     if let Some(interpreter) = llm_interpreter {
         publish_status(
@@ -422,17 +448,45 @@ async fn process_finalized_segment(
             segment_id: uuid::Uuid::new_v4().to_string(),
             finalized_text: chunk.text.clone(),
             literal_text: chunk.text.clone(),
-            recent_text: recent_text_window(committed_text, config.intelligence.max_recent_chars),
+            recent_text: recent_text_window(committed_prefix, config.intelligence.max_recent_chars),
+            active_block_raw: active_block
+                .as_ref()
+                .map(|block| block.raw_text.clone())
+                .unwrap_or_default(),
+            active_block_rendered: active_block
+                .as_ref()
+                .map(|block| block.rendered_text.clone())
+                .unwrap_or_default(),
             action_scope: config.intelligence.action_scope.clone(),
             command_mode: config.intelligence.command_mode.clone(),
             text_output_mode: config.intelligence.text_output_mode.clone(),
+            preferred_list_style: PreferredListStyle::Numbered,
+            formatting_trigger_policy: FormattingTriggerPolicy::ClearStructureOnly,
+            correction_scope: CorrectionScope::CurrentBlockOnly,
         };
 
         match interpreter.decide(&request).await {
             Ok(output) => {
-                let next_rendered =
-                    render_transcript(committed_text, &output.decision.text_to_emit);
+                let next_rendered = match output.decision.rewrite_scope {
+                    RewriteScope::CurrentBlock => render_transcript(
+                        committed_prefix,
+                        Some(&FormattingBlock {
+                            raw_text: next_block_raw(active_block.as_ref(), &chunk.text),
+                            rendered_text: output.decision.text_to_emit.clone(),
+                            format_kind: output.decision.format_kind.clone(),
+                        }),
+                        "",
+                    ),
+                    RewriteScope::Segment => render_with_segment_decision(
+                        committed_prefix,
+                        active_block.as_ref(),
+                        &output.decision.text_to_emit,
+                        &output.decision.format_kind,
+                    ),
+                };
                 apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+                let closes_block =
+                    !output.decision.actions.is_empty() || !output.decision.keep_block_open;
                 if let Err(error) = keyboard.emit_actions(&output.decision.actions) {
                     warn!("failed to emit intelligent action(s): {error}");
                     publish_status(
@@ -445,22 +499,55 @@ async fn process_finalized_segment(
                     )
                     .await;
                 } else {
+                    let intelligence_state =
+                        if output.decision.rewrite_scope == RewriteScope::CurrentBlock {
+                            Some("Formatting current block".to_string())
+                        } else {
+                            Some(format!("Decision: {}", output.decision.kind.as_label()))
+                        };
                     publish_status(
                         state,
                         StatusUpdate {
                             last_llm_error: Some(None),
                             last_decision_kind: Some(Some(output.decision.kind.clone())),
-                            intelligence_state: Some(Some(format!(
-                                "Decision: {}",
-                                output.decision.kind.as_label()
-                            ))),
+                            intelligence_state: Some(intelligence_state),
                             ..StatusUpdate::default()
                         },
                     )
                     .await;
                 }
 
-                *committed_text = next_rendered;
+                match output.decision.rewrite_scope {
+                    RewriteScope::CurrentBlock => {
+                        let next_raw = next_block_raw(active_block.as_ref(), &chunk.text);
+                        if closes_block {
+                            *committed_prefix = render_committed(
+                                committed_prefix,
+                                Some(&FormattingBlock {
+                                    raw_text: next_raw,
+                                    rendered_text: output.decision.text_to_emit,
+                                    format_kind: output.decision.format_kind,
+                                }),
+                            );
+                            *active_block = None;
+                        } else {
+                            *active_block = Some(FormattingBlock {
+                                raw_text: next_raw,
+                                rendered_text: output.decision.text_to_emit,
+                                format_kind: output.decision.format_kind,
+                            });
+                        }
+                    }
+                    RewriteScope::Segment => {
+                        *committed_prefix = render_with_segment_decision(
+                            committed_prefix,
+                            active_block.as_ref(),
+                            &output.decision.text_to_emit,
+                            &output.decision.format_kind,
+                        );
+                        *active_block = None;
+                    }
+                }
                 active_turn.clear();
                 return;
             }
@@ -480,9 +567,11 @@ async fn process_finalized_segment(
         }
     }
 
-    let next_rendered = render_transcript(committed_text, &chunk.text);
+    let next_rendered =
+        render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
     apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
-    *committed_text = next_rendered;
+    *committed_prefix = next_rendered;
+    *active_block = None;
     active_turn.clear();
 }
 
@@ -516,7 +605,15 @@ async fn apply_transcript(
     latest: &str,
 ) {
     let patch = diff_patch(previous, latest);
-    let _ = keyboard.emit_patch(&patch);
+    if let Err(error) = keyboard.emit_patch(&patch) {
+        warn!("failed to emit transcript patch: {error}");
+        let mut status = state.status.write().await.clone();
+        status.last_error = Some(format!("Text injection failed: {error}"));
+        status.updated_at = Utc::now();
+        state.overlay.push(status.clone());
+        *state.status.write().await = status;
+        return;
+    }
 
     let mut status = state.status.write().await;
     status.partial_transcript = Some(latest.to_string());
@@ -645,8 +742,94 @@ async fn publish_status(state: &Arc<AppState>, update: StatusUpdate) {
     *state.status.write().await = status;
 }
 
-fn render_transcript(committed: &str, active_turn: &str) -> String {
-    append_turn(committed, active_turn)
+async fn finalize_unresolved_turn(
+    state: &Arc<AppState>,
+    keyboard: &mut UInputKeyboard,
+    committed_prefix: &mut String,
+    active_block: &mut Option<FormattingBlock>,
+    active_turn: &mut String,
+) {
+    if active_turn.trim().is_empty() {
+        active_turn.clear();
+        return;
+    }
+
+    let previous_rendered = render_transcript(committed_prefix, active_block.as_ref(), active_turn);
+    let next_rendered =
+        render_literal_fallback(committed_prefix, active_block.as_ref(), active_turn);
+    apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+    *committed_prefix = next_rendered;
+    *active_block = None;
+    active_turn.clear();
+}
+
+fn render_transcript(
+    committed_prefix: &str,
+    active_block: Option<&FormattingBlock>,
+    active_turn: &str,
+) -> String {
+    let committed = render_committed(committed_prefix, active_block);
+    append_turn(&committed, active_turn)
+}
+
+fn render_committed(committed_prefix: &str, active_block: Option<&FormattingBlock>) -> String {
+    match active_block {
+        Some(block) => append_block(committed_prefix, &block.rendered_text, &block.format_kind),
+        None => committed_prefix.to_string(),
+    }
+}
+
+fn render_with_segment_decision(
+    committed_prefix: &str,
+    active_block: Option<&FormattingBlock>,
+    segment_text: &str,
+    format_kind: &FormatKind,
+) -> String {
+    let base = render_committed(committed_prefix, active_block);
+    append_block(&base, segment_text, format_kind)
+}
+
+fn render_literal_fallback(
+    committed_prefix: &str,
+    active_block: Option<&FormattingBlock>,
+    literal_text: &str,
+) -> String {
+    render_with_segment_decision(
+        committed_prefix,
+        active_block,
+        literal_text,
+        &FormatKind::Plain,
+    )
+}
+
+fn next_block_raw(active_block: Option<&FormattingBlock>, finalized_text: &str) -> String {
+    match active_block {
+        Some(block) => append_turn(&block.raw_text, finalized_text),
+        None => finalized_text.trim().to_string(),
+    }
+}
+
+fn append_block(committed: &str, block_text: &str, format_kind: &FormatKind) -> String {
+    let block_text = block_text.trim();
+    if block_text.is_empty() {
+        return committed.to_string();
+    }
+    if committed.is_empty() {
+        return block_text.to_string();
+    }
+    if matches!(
+        format_kind,
+        FormatKind::NumberedList | FormatKind::BulletList
+    ) || block_text.contains('\n')
+    {
+        if committed.ends_with('\n') {
+            format!("{committed}{block_text}")
+        } else {
+            format!("{committed}\n{block_text}")
+        }
+    } else {
+        append_turn(committed, block_text)
+    }
 }
 
 fn append_turn(committed: &str, turn: &str) -> String {

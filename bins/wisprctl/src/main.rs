@@ -2,8 +2,8 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 use wispr_core::{
-    AppConfig, CommandMode, DictationProxy, LlmInterpreter, Result, SegmentDecisionRequest,
-    TextOutputMode,
+    AppConfig, CommandMode, CorrectionScope, DictationProxy, FormattingTriggerPolicy,
+    LlmInterpreter, PreferredListStyle, Result, SegmentDecisionRequest, TextOutputMode,
     install::{install_uinput_rule, write_default_config, write_user_service},
     secrets::SecretStore,
 };
@@ -87,15 +87,23 @@ async fn test_llm(text: &str) -> Result<String> {
             finalized_text: text.to_string(),
             literal_text: text.to_string(),
             recent_text: String::new(),
+            active_block_raw: String::new(),
+            active_block_rendered: String::new(),
             action_scope: config.intelligence.action_scope.clone(),
             command_mode: CommandMode::AlwaysInfer,
             text_output_mode: TextOutputMode::Literal,
+            preferred_list_style: PreferredListStyle::Numbered,
+            formatting_trigger_policy: FormattingTriggerPolicy::ClearStructureOnly,
+            correction_scope: CorrectionScope::CurrentBlockOnly,
         })
         .await?;
 
     Ok(format!(
-        "decision={} text_to_emit={:?} actions={:?} raw={}",
+        "decision={} rewrite_scope={:?} format_kind={:?} keep_block_open={} text_to_emit={:?} actions={:?} raw={}",
         output.decision.kind.as_label(),
+        output.decision.rewrite_scope,
+        output.decision.format_kind,
+        output.decision.keep_block_open,
         output.decision.text_to_emit,
         output.decision.actions,
         output.streamed_text

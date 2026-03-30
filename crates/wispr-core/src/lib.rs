@@ -12,7 +12,8 @@ pub use error::{Result, WisprError};
 pub use ipc::{DICTATION_INTERFACE, DICTATION_OBJECT_PATH, DICTATION_SERVICE, DictationProxy};
 pub use llm::{InterpreterOutput, LlmInterpreter};
 pub use models::{
-    ActionCommand, ActionKey, ActionScope, ActionType, CommandMode, DaemonStatus, DecisionKind,
-    DeviceChoice, DictationState, HotkeyBinding, ModifierKey, SegmentDecision,
-    SegmentDecisionRequest, TextOutputMode,
+    ActionCommand, ActionKey, ActionScope, ActionType, CommandMode, CorrectionScope, DaemonStatus,
+    DecisionKind, DeviceChoice, DictationState, FormatKind, FormattingTriggerPolicy, HotkeyBinding,
+    ModifierKey, PreferredListStyle, RewriteScope, SegmentDecision, SegmentDecisionRequest,
+    TextOutputMode,
 };

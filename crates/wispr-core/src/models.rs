@@ -145,6 +145,69 @@ pub enum ActionKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteScope {
+    Segment,
+    CurrentBlock,
+}
+
+impl Default for RewriteScope {
+    fn default() -> Self {
+        Self::Segment
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatKind {
+    Plain,
+    NumberedList,
+    BulletList,
+}
+
+impl Default for FormatKind {
+    fn default() -> Self {
+        Self::Plain
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredListStyle {
+    Numbered,
+}
+
+impl Default for PreferredListStyle {
+    fn default() -> Self {
+        Self::Numbered
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FormattingTriggerPolicy {
+    ClearStructureOnly,
+}
+
+impl Default for FormattingTriggerPolicy {
+    fn default() -> Self {
+        Self::ClearStructureOnly
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionScope {
+    CurrentBlockOnly,
+}
+
+impl Default for CorrectionScope {
+    fn default() -> Self {
+        Self::CurrentBlockOnly
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionCommand {
     #[serde(rename = "type")]
     pub action_type: ActionType,
@@ -162,7 +225,13 @@ fn default_repeat() -> u8 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentDecision {
     pub kind: DecisionKind,
+    #[serde(default)]
+    pub rewrite_scope: RewriteScope,
+    #[serde(default)]
+    pub format_kind: FormatKind,
     pub text_to_emit: String,
+    #[serde(default)]
+    pub keep_block_open: bool,
     #[serde(default)]
     pub actions: Vec<ActionCommand>,
 }
@@ -171,7 +240,10 @@ impl SegmentDecision {
     pub fn literal(text: impl Into<String>) -> Self {
         Self {
             kind: DecisionKind::Literal,
+            rewrite_scope: RewriteScope::Segment,
+            format_kind: FormatKind::Plain,
             text_to_emit: text.into(),
+            keep_block_open: false,
             actions: Vec::new(),
         }
     }
@@ -183,9 +255,19 @@ pub struct SegmentDecisionRequest {
     pub finalized_text: String,
     pub literal_text: String,
     pub recent_text: String,
+    #[serde(default)]
+    pub active_block_raw: String,
+    #[serde(default)]
+    pub active_block_rendered: String,
     pub action_scope: ActionScope,
     pub command_mode: CommandMode,
     pub text_output_mode: TextOutputMode,
+    #[serde(default)]
+    pub preferred_list_style: PreferredListStyle,
+    #[serde(default)]
+    pub formatting_trigger_policy: FormattingTriggerPolicy,
+    #[serde(default)]
+    pub correction_scope: CorrectionScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

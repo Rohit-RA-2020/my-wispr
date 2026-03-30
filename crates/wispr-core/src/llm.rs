@@ -9,8 +9,9 @@ use crate::{
     config::IntelligenceConfig,
     error::{Result, WisprError},
     models::{
-        ActionCommand, ActionKey, ActionScope, ActionType, CommandMode, DecisionKind, ModifierKey,
-        SegmentDecision, SegmentDecisionRequest, TextOutputMode,
+        ActionCommand, ActionKey, ActionScope, ActionType, CommandMode, CorrectionScope,
+        DecisionKind, FormattingTriggerPolicy, ModifierKey, PreferredListStyle, SegmentDecision,
+        SegmentDecisionRequest, TextOutputMode,
     },
 };
 
@@ -46,9 +47,14 @@ impl LlmInterpreter {
             finalized_text: "hello enter".to_string(),
             literal_text: "hello enter".to_string(),
             recent_text: String::new(),
+            active_block_raw: String::new(),
+            active_block_rendered: String::new(),
             action_scope: self.config.action_scope.clone(),
             command_mode: CommandMode::AlwaysInfer,
             text_output_mode: TextOutputMode::Literal,
+            preferred_list_style: PreferredListStyle::Numbered,
+            formatting_trigger_policy: FormattingTriggerPolicy::ClearStructureOnly,
+            correction_scope: CorrectionScope::CurrentBlockOnly,
         })
         .await
     }
@@ -281,21 +287,32 @@ fn build_request_body(
 }
 
 fn developer_prompt() -> &'static str {
-    "You are Wispr, a safe dictation command interpreter. You receive one finalized spoken segment plus recent typed context. Return strict JSON only. Keep normal dictation literal. Only convert clearly spoken editing commands into allowed keyboard actions. Never invent actions. Never launch apps, run shell commands, click, move the mouse, or use unsupported shortcuts. Allowed special keys: Space, Enter, Tab, Escape, Backspace, Delete, Left, Right, Up, Down, Home, End, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12. Allowed shortcuts: Ctrl+A, Ctrl+C, Ctrl+V, Ctrl+X, Ctrl+Z, Ctrl+Shift+Z. Each action may set repeat to run the same key multiple times, such as Space repeated twice. If the spoken text is ordinary prose, return kind literal and keep text_to_emit equal to the literal transcript. If command words should not remain in the editor, remove them from text_to_emit. Normalize command-like text when the user is dictating shell commands or flags: for example 'flutter dash dash version enter' or 'flutter hyphen hyphen version enter' should become text_to_emit 'flutter --version' plus Enter. 'press space key twice' should produce a Space key action with repeat 2. 'press the F5 key' should produce an F5 key action."
+    "You are Wispr, a safe dictation command interpreter and formatter. You receive one finalized spoken segment, recent typed context, and optionally the current active formatting block. Return strict JSON only. Keep ordinary prose literal unless structure is explicit or very strong. Prefer numbered lists for sequential speech. Use bullet lists only when the speech is clearly unordered. Spoken corrections such as 'wait', 'no', 'not X, Y instead', or 'replace the third one' should usually rewrite the current block, not append a new literal sentence. rewrite_scope='segment' means only the current finalized segment should be committed. rewrite_scope='current_block' means text_to_emit is the full replacement for the active formatting block. keep_block_open should stay true while the user is still building or correcting the same list or note block. Allowed special keys: Space, Enter, Tab, Escape, Backspace, Delete, Left, Right, Up, Down, Home, End, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12. Allowed shortcuts: Ctrl+A, Ctrl+C, Ctrl+V, Ctrl+X, Ctrl+Z, Ctrl+Shift+Z. Each action may set repeat to run the same key multiple times, such as Space repeated twice. Never invent actions. Never launch apps, run shell commands, click, move the mouse, or use unsupported shortcuts. If the spoken text is ordinary prose, return kind literal, format_kind plain, rewrite_scope segment, and keep text_to_emit equal to the literal transcript. If command words should not remain in the editor, remove them from text_to_emit. Normalize command-like text when the user is dictating shell commands or flags: for example 'flutter dash dash version enter' should become text_to_emit 'flutter --version' plus Enter. Example formatting behavior: a spoken to-do list should become a numbered list; a later correction like 'wait, not housecleaning, washing of clothes' should rewrite the current list block so the corrected item replaces the old one."
 }
 
 fn decision_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["kind", "text_to_emit", "actions"],
+        "required": ["kind", "rewrite_scope", "format_kind", "text_to_emit", "keep_block_open", "actions"],
         "properties": {
             "kind": {
                 "type": "string",
                 "enum": ["literal", "action", "literal_and_action"]
             },
+            "rewrite_scope": {
+                "type": "string",
+                "enum": ["segment", "current_block"]
+            },
+            "format_kind": {
+                "type": "string",
+                "enum": ["plain", "numbered_list", "bullet_list"]
+            },
             "text_to_emit": {
                 "type": "string"
+            },
+            "keep_block_open": {
+                "type": "boolean"
             },
             "actions": {
                 "type": "array",
@@ -503,7 +520,10 @@ fn validate_decision(
     if decision.kind == DecisionKind::Action && !decision.text_to_emit.is_empty() {
         return Ok(SegmentDecision {
             kind: DecisionKind::LiteralAndAction,
+            rewrite_scope: decision.rewrite_scope,
+            format_kind: decision.format_kind,
             text_to_emit: normalized_text,
+            keep_block_open: decision.keep_block_open,
             actions: decision.actions,
         });
     }

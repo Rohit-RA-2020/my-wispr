@@ -327,6 +327,9 @@ fn build_keymap() -> HashMap<char, KeyStroke> {
         ('-', KeyCode::KEY_MINUS),
         ('=', KeyCode::KEY_EQUAL),
         (';', KeyCode::KEY_SEMICOLON),
+        ('\n', KeyCode::KEY_ENTER),
+        ('\r', KeyCode::KEY_ENTER),
+        ('\t', KeyCode::KEY_TAB),
     ] {
         map.insert(
             ch,
