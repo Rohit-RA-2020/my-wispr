@@ -16,11 +16,24 @@ use wispr_core::error::{Result, WisprError};
 const DEEPGRAM_URL: &str = "wss://api.deepgram.com/v1/listen?model=nova-3&language=en&encoding=linear16&sample_rate=16000&interim_results=true&smart_format=true&punctuate=true&dictation=true&utterance_end_ms=1500&tag=wispr";
 
 #[derive(Debug, Clone)]
+pub struct TranscriptChunk {
+    pub text: String,
+    pub start: f64,
+    pub duration: f64,
+}
+
+impl TranscriptChunk {
+    pub fn dedupe_key(&self) -> String {
+        format!("{:.3}:{:.3}:{}", self.start, self.duration, self.text)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum TranscriptEvent {
-    Partial(String),
-    Final(String),
+    Partial(TranscriptChunk),
+    Final(TranscriptChunk),
     TurnEnded,
-    TurnEndedWithTranscript(String),
+    TurnEndedWithTranscript(TranscriptChunk),
     Warning(String),
 }
 
@@ -140,6 +153,8 @@ struct DeepgramMessage {
     error: Option<String>,
     event: Option<String>,
     transcript: Option<String>,
+    start: Option<f64>,
+    duration: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,37 +181,49 @@ impl DeepgramMessage {
                     return None;
                 }
 
+                let chunk = TranscriptChunk {
+                    text: transcript,
+                    start: self.start.unwrap_or_default(),
+                    duration: self.duration.unwrap_or_default(),
+                };
+
                 if self.is_final.unwrap_or(false) || self.speech_final.unwrap_or(false) {
-                    Some(TranscriptEvent::Final(transcript))
+                    Some(TranscriptEvent::Final(chunk))
                 } else {
-                    Some(TranscriptEvent::Partial(transcript))
+                    Some(TranscriptEvent::Partial(chunk))
                 }
             }
             Some("UtteranceEnd") => Some(TranscriptEvent::TurnEnded),
             Some("SpeechStarted") => None,
             Some("TurnInfo") => {
                 let transcript = self.transcript.unwrap_or_default();
+                let chunk = TranscriptChunk {
+                    text: transcript,
+                    start: self.start.unwrap_or_default(),
+                    duration: self.duration.unwrap_or_default(),
+                };
+
                 match self.event.as_deref() {
                     Some("Update") | Some("EagerEndOfTurn") | Some("TurnResumed") => {
-                        if transcript.is_empty() {
+                        if chunk.text.is_empty() {
                             None
                         } else {
-                            Some(TranscriptEvent::Partial(transcript))
+                            Some(TranscriptEvent::Partial(chunk))
                         }
                     }
                     Some("EndOfTurn") => {
-                        if transcript.is_empty() {
+                        if chunk.text.is_empty() {
                             Some(TranscriptEvent::TurnEnded)
                         } else {
-                            Some(TranscriptEvent::TurnEndedWithTranscript(transcript))
+                            Some(TranscriptEvent::TurnEndedWithTranscript(chunk))
                         }
                     }
                     Some("StartOfTurn") => None,
                     Some(_) | None => {
-                        if transcript.is_empty() {
+                        if chunk.text.is_empty() {
                             Some(TranscriptEvent::TurnEnded)
                         } else {
-                            Some(TranscriptEvent::Partial(transcript))
+                            Some(TranscriptEvent::Partial(chunk))
                         }
                     }
                 }

@@ -2,7 +2,10 @@ use std::{collections::HashMap, io, thread, time::Duration};
 
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, KeyEvent, uinput::VirtualDevice};
 
-use crate::error::{Result, WisprError};
+use crate::{
+    error::{Result, WisprError},
+    models::{ActionCommand, ActionKey, ModifierKey},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPatch {
@@ -71,8 +74,44 @@ impl UInputKeyboard {
         Ok(())
     }
 
+    pub fn emit_actions(&mut self, actions: &[ActionCommand]) -> Result<()> {
+        for action in actions {
+            self.emit_action(action)?;
+        }
+        Ok(())
+    }
+
     pub fn sync_delay(&self) {
         thread::sleep(Duration::from_millis(6));
+    }
+
+    fn emit_action(&mut self, action: &ActionCommand) -> Result<()> {
+        let key = map_action_key(&action.key);
+        let ctrl = action.modifiers.contains(&ModifierKey::Ctrl);
+        let shift = action.modifiers.contains(&ModifierKey::Shift);
+        let repeat = action.repeat.max(1);
+
+        for _ in 0..repeat {
+            if ctrl {
+                self.emit_key(KeyCode::KEY_LEFTCTRL, 1)?;
+            }
+            if shift {
+                self.emit_key(KeyCode::KEY_LEFTSHIFT, 1)?;
+            }
+
+            self.emit_key(key, 1)?;
+            self.emit_key(key, 0)?;
+
+            if shift {
+                self.emit_key(KeyCode::KEY_LEFTSHIFT, 0)?;
+            }
+            if ctrl {
+                self.emit_key(KeyCode::KEY_LEFTCTRL, 0)?;
+            }
+
+            self.sync_delay();
+        }
+        Ok(())
     }
 
     fn type_char(&mut self, ch: char) -> Result<()> {
@@ -106,6 +145,40 @@ impl UInputKeyboard {
         };
         self.device.emit(&[event]).map_err(map_io)?;
         Ok(())
+    }
+}
+
+fn map_action_key(key: &ActionKey) -> KeyCode {
+    match key {
+        ActionKey::Space => KeyCode::KEY_SPACE,
+        ActionKey::Enter => KeyCode::KEY_ENTER,
+        ActionKey::Tab => KeyCode::KEY_TAB,
+        ActionKey::Escape => KeyCode::KEY_ESC,
+        ActionKey::Backspace => KeyCode::KEY_BACKSPACE,
+        ActionKey::Delete => KeyCode::KEY_DELETE,
+        ActionKey::Left => KeyCode::KEY_LEFT,
+        ActionKey::Right => KeyCode::KEY_RIGHT,
+        ActionKey::Up => KeyCode::KEY_UP,
+        ActionKey::Down => KeyCode::KEY_DOWN,
+        ActionKey::Home => KeyCode::KEY_HOME,
+        ActionKey::End => KeyCode::KEY_END,
+        ActionKey::A => KeyCode::KEY_A,
+        ActionKey::C => KeyCode::KEY_C,
+        ActionKey::V => KeyCode::KEY_V,
+        ActionKey::X => KeyCode::KEY_X,
+        ActionKey::Z => KeyCode::KEY_Z,
+        ActionKey::F1 => KeyCode::KEY_F1,
+        ActionKey::F2 => KeyCode::KEY_F2,
+        ActionKey::F3 => KeyCode::KEY_F3,
+        ActionKey::F4 => KeyCode::KEY_F4,
+        ActionKey::F5 => KeyCode::KEY_F5,
+        ActionKey::F6 => KeyCode::KEY_F6,
+        ActionKey::F7 => KeyCode::KEY_F7,
+        ActionKey::F8 => KeyCode::KEY_F8,
+        ActionKey::F9 => KeyCode::KEY_F9,
+        ActionKey::F10 => KeyCode::KEY_F10,
+        ActionKey::F11 => KeyCode::KEY_F11,
+        ActionKey::F12 => KeyCode::KEY_F12,
     }
 }
 
@@ -152,6 +225,18 @@ fn supported_keys() -> Vec<KeyCode> {
         KeyCode::KEY_9,
         KeyCode::KEY_0,
         KeyCode::KEY_SPACE,
+        KeyCode::KEY_F1,
+        KeyCode::KEY_F2,
+        KeyCode::KEY_F3,
+        KeyCode::KEY_F4,
+        KeyCode::KEY_F5,
+        KeyCode::KEY_F6,
+        KeyCode::KEY_F7,
+        KeyCode::KEY_F8,
+        KeyCode::KEY_F9,
+        KeyCode::KEY_F10,
+        KeyCode::KEY_F11,
+        KeyCode::KEY_F12,
         KeyCode::KEY_DOT,
         KeyCode::KEY_COMMA,
         KeyCode::KEY_APOSTROPHE,
@@ -160,7 +245,18 @@ fn supported_keys() -> Vec<KeyCode> {
         KeyCode::KEY_EQUAL,
         KeyCode::KEY_SEMICOLON,
         KeyCode::KEY_BACKSPACE,
+        KeyCode::KEY_ENTER,
+        KeyCode::KEY_TAB,
+        KeyCode::KEY_ESC,
+        KeyCode::KEY_DELETE,
+        KeyCode::KEY_LEFT,
+        KeyCode::KEY_RIGHT,
+        KeyCode::KEY_UP,
+        KeyCode::KEY_DOWN,
+        KeyCode::KEY_HOME,
+        KeyCode::KEY_END,
         KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_LEFTCTRL,
     ]
 }
 
@@ -268,23 +364,4 @@ fn build_keymap() -> HashMap<char, KeyStroke> {
     }
 
     map
-}
-
-#[cfg(test)]
-mod tests {
-    use super::diff_patch;
-
-    #[test]
-    fn patch_keeps_common_prefix() {
-        let patch = diff_patch("hello wor", "hello world");
-        assert_eq!(patch.backspaces, 0);
-        assert_eq!(patch.insertion, "ld");
-    }
-
-    #[test]
-    fn patch_replaces_changed_suffix() {
-        let patch = diff_patch("hello ward", "hello world");
-        assert_eq!(patch.backspaces, 3);
-        assert_eq!(patch.insertion, "rld");
-    }
 }

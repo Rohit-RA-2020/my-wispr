@@ -37,7 +37,7 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
     let window = gtk::Window::builder()
         .title("Wispr Overlay")
         .default_width(380)
-        .default_height(110)
+        .default_height(150)
         .decorated(false)
         .resizable(false)
         .deletable(false)
@@ -72,10 +72,17 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .build();
+    let intelligence_label = gtk::Label::builder()
+        .xalign(0.0)
+        .halign(Align::Start)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
 
     container.append(&state_label);
     container.append(&mic_label);
     container.append(&transcript_label);
+    container.append(&intelligence_label);
     window.set_child(Some(&container));
 
     glib::timeout_add_local(Duration::from_millis(60), move || {
@@ -97,6 +104,13 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
                 .unwrap_or_else(|| "Mic: not selected".to_string()),
         );
         transcript_label.set_label(status.partial_transcript.as_deref().unwrap_or(""));
+        intelligence_label.set_label(
+            &status
+                .intelligence_state
+                .as_ref()
+                .map(|state| format!("Intelligence: {state}"))
+                .unwrap_or_default(),
+        );
 
         if matches!(status.state, DictationState::Idle) {
             live_window.hide();

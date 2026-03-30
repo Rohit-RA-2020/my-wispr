@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Result, WisprError},
-    models::{DeviceChoice, HotkeyBinding},
+    models::{ActionScope, CommandMode, DeviceChoice, HotkeyBinding, TextOutputMode},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OverlayConfig {
     pub enabled: bool,
     pub show_partial_text: bool,
@@ -26,6 +27,7 @@ impl Default for OverlayConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TypingConfig {
     pub enabled: bool,
     pub emit_backspaces: bool,
@@ -41,9 +43,41 @@ impl Default for TypingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntelligenceConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub model: String,
+    pub timeout_ms: u64,
+    pub max_recent_chars: usize,
+    pub command_mode: CommandMode,
+    pub text_output_mode: TextOutputMode,
+    pub action_scope: ActionScope,
+    pub debug_overlay: bool,
+}
+
+impl Default for IntelligenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            timeout_ms: 2_500,
+            max_recent_chars: 256,
+            command_mode: CommandMode::AlwaysInfer,
+            text_output_mode: TextOutputMode::Literal,
+            action_scope: ActionScope::EditingOnly,
+            debug_overlay: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub overlay: OverlayConfig,
     pub typing: TypingConfig,
+    pub intelligence: IntelligenceConfig,
     pub autostart: bool,
     pub selected_device: Option<DeviceChoice>,
     pub hotkey: HotkeyBinding,
@@ -54,6 +88,7 @@ impl Default for AppConfig {
         Self {
             overlay: OverlayConfig::default(),
             typing: TypingConfig::default(),
+            intelligence: IntelligenceConfig::default(),
             autostart: true,
             selected_device: None,
             hotkey: HotkeyBinding::default(),

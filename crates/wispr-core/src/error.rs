@@ -14,6 +14,8 @@ pub enum WisprError {
     TomlSer(#[from] toml::ser::Error),
     #[error("serde json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("http error: {0}")]
+    Http(String),
     #[error("secret-service error: {0}")]
     SecretService(String),
     #[error("dbus error: {0}")]
@@ -31,6 +33,12 @@ impl From<zbus::Error> for WisprError {
 impl From<secret_service::Error> for WisprError {
     fn from(value: secret_service::Error) -> Self {
         Self::SecretService(value.to_string())
+    }
+}
+
+impl From<reqwest::Error> for WisprError {
+    fn from(value: reqwest::Error) -> Self {
+        Self::Http(value.to_string())
     }
 }
 

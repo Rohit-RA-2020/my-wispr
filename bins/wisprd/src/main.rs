@@ -3,17 +3,17 @@ mod deepgram;
 mod overlay;
 mod portal;
 
-use std::{future::pending, process::Command, sync::Arc};
+use std::{collections::HashSet, future::pending, process::Command, sync::Arc};
 
 use audio::{AudioCapture, resolve_selected_device};
 use chrono::Utc;
-use deepgram::{DeepgramSession, TranscriptEvent};
+use deepgram::{DeepgramSession, TranscriptChunk, TranscriptEvent};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
 use wispr_core::{
-    AppConfig, Result,
-    models::{DaemonStatus, DictationState},
+    AppConfig, DecisionKind, LlmInterpreter, Result, SegmentDecisionRequest, WisprError,
+    models::{DaemonStatus, DeviceChoice, DictationState},
     secrets::SecretStore,
     typing::{UInputKeyboard, diff_patch},
 };
@@ -31,6 +31,19 @@ struct AppState {
 
 struct RunningSession {
     stop_tx: oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct StatusUpdate {
+    state: Option<DictationState>,
+    current_mic: Option<Option<DeviceChoice>>,
+    partial_transcript: Option<Option<String>>,
+    last_error: Option<Option<String>>,
+    intelligence_ready: Option<bool>,
+    llm_ready: Option<bool>,
+    last_llm_error: Option<Option<String>>,
+    last_decision_kind: Option<Option<DecisionKind>>,
+    intelligence_state: Option<Option<String>>,
 }
 
 struct DictationDbus {
@@ -150,7 +163,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
 
     let config = state.config.read().await.clone();
     let selected = resolve_selected_device(&config).ok_or_else(|| {
-        wispr_core::WisprError::InvalidState(
+        WisprError::InvalidState(
             "No valid microphone is selected. Open wispr-settings and choose a microphone."
                 .to_string(),
         )
@@ -158,15 +171,22 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
 
     let secret_store = SecretStore::connect().await?;
     let api_key = secret_store.get_api_key().await?.ok_or_else(|| {
-        wispr_core::WisprError::InvalidState(
+        WisprError::InvalidState(
             "No Deepgram API key is stored yet. Open wispr-settings first.".to_string(),
         )
     })?;
-    let mut keyboard = UInputKeyboard::open().map_err(|error| {
-        wispr_core::WisprError::InvalidState(format!(
-            "Typing engine failed to open /dev/uinput: {error}"
-        ))
+    let mut keyboard = wispr_core::typing::UInputKeyboard::open().map_err(|error| {
+        WisprError::InvalidState(format!("Typing engine failed to open /dev/uinput: {error}"))
     })?;
+
+    let llm_state = load_llm_interpreter(&config, &secret_store).await?;
+    let llm_ready = llm_state.is_some();
+    let intelligence_ready = !config.intelligence.enabled || llm_ready;
+    let llm_setup_error = if config.intelligence.enabled && !llm_ready {
+        Some("Intelligence is enabled but the LLM backend is not configured. Falling back to literal dictation.".to_string())
+    } else {
+        None
+    };
 
     let capture = AudioCapture::start(&selected)?;
     let audio_rx = capture.receiver();
@@ -176,10 +196,25 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
 
     publish_status(
         &state,
-        Some(DictationState::Listening),
-        Some(selected.clone()),
-        Some(String::new()),
-        None,
+        StatusUpdate {
+            state: Some(DictationState::Listening),
+            current_mic: Some(Some(selected.clone())),
+            partial_transcript: Some(Some(String::new())),
+            intelligence_ready: Some(intelligence_ready),
+            llm_ready: Some(llm_ready),
+            last_error: Some(None),
+            last_llm_error: Some(llm_setup_error.clone()),
+            last_decision_kind: Some(None),
+            intelligence_state: Some(Some(if config.intelligence.enabled {
+                if llm_ready {
+                    "Interpreter ready".to_string()
+                } else {
+                    "Literal fallback".to_string()
+                }
+            } else {
+                "Intelligence disabled".to_string()
+            })),
+        },
     )
     .await;
 
@@ -191,6 +226,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
         let mut logged_audio = false;
         let mut shutting_down = false;
         let mut shutdown_deadline = None::<Instant>;
+        let mut processed_finals = HashSet::<String>::new();
+        let llm_interpreter = llm_state;
 
         loop {
             tokio::select! {
@@ -218,10 +255,11 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 if audio_tx.send(chunk).await.is_err() {
                                     publish_status(
                                         &state_for_task,
-                                        Some(DictationState::Error),
-                                        None,
-                                        None,
-                                        Some("Failed to forward audio to Deepgram".to_string()),
+                                        StatusUpdate {
+                                            state: Some(DictationState::Error),
+                                            last_error: Some(Some("Failed to forward audio to Deepgram".to_string())),
+                                            ..StatusUpdate::default()
+                                        },
                                     )
                                     .await;
                                     break;
@@ -231,10 +269,11 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                         Err(_) => {
                             publish_status(
                                 &state_for_task,
-                                Some(DictationState::Error),
-                                None,
-                                None,
-                                Some("Audio stream ended unexpectedly".to_string()),
+                                StatusUpdate {
+                                    state: Some(DictationState::Error),
+                                    last_error: Some(Some("Audio stream ended unexpectedly".to_string())),
+                                    ..StatusUpdate::default()
+                                },
                             )
                             .await;
                             let mut guard = state_for_task.session.lock().await;
@@ -245,17 +284,26 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                 }
                 maybe_event = deepgram.next_event() => {
                     let Some(event) = maybe_event else {
-                        publish_status(&state_for_task, Some(DictationState::Idle), None, None, None).await;
+                        publish_status(
+                            &state_for_task,
+                            StatusUpdate {
+                                state: Some(DictationState::Idle),
+                                partial_transcript: Some(None),
+                                intelligence_state: Some(None),
+                                ..StatusUpdate::default()
+                            },
+                        )
+                        .await;
                         let mut guard = state_for_task.session.lock().await;
                         *guard = None;
                         break;
                     };
 
                     match event {
-                        TranscriptEvent::Partial(text) => {
-                            info!("deepgram partial: {}", text);
+                        TranscriptEvent::Partial(chunk) => {
+                            info!("deepgram partial: {}", chunk.text);
                             let previous_rendered = render_transcript(&committed_text, &active_turn);
-                            let next_rendered = render_transcript(&committed_text, &text);
+                            let next_rendered = render_transcript(&committed_text, &chunk.text);
                             apply_transcript(
                                 &state_for_task,
                                 &mut keyboard,
@@ -263,49 +311,57 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 &next_rendered,
                             )
                             .await;
-                            active_turn = text;
+                            active_turn = chunk.text;
                         }
-                        TranscriptEvent::Final(text) => {
-                            info!("deepgram final: {}", text);
-                            let previous_rendered = render_transcript(&committed_text, &active_turn);
-                            let next_rendered = render_transcript(&committed_text, &text);
-                            apply_transcript(
+                        TranscriptEvent::Final(chunk) => {
+                            if !processed_finals.insert(chunk.dedupe_key()) {
+                                continue;
+                            }
+
+                            info!("deepgram final: {}", chunk.text);
+                            process_finalized_segment(
                                 &state_for_task,
+                                &config,
                                 &mut keyboard,
-                                &previous_rendered,
-                                &next_rendered,
+                                &llm_interpreter,
+                                &mut committed_text,
+                                &mut active_turn,
+                                chunk,
                             )
                             .await;
-                            committed_text = next_rendered;
-                            active_turn.clear();
                         }
                         TranscriptEvent::TurnEnded => {
                             info!("deepgram turn ended");
                             committed_text = append_turn(&committed_text, &active_turn);
                             active_turn.clear();
                         }
-                        TranscriptEvent::TurnEndedWithTranscript(text) => {
-                            info!("deepgram turn ended with transcript: {}", text);
-                            let previous_rendered = render_transcript(&committed_text, &active_turn);
-                            let next_rendered = render_transcript(&committed_text, &text);
-                            apply_transcript(
-                                &state_for_task,
-                                &mut keyboard,
-                                &previous_rendered,
-                                &next_rendered,
-                            )
-                            .await;
-                            committed_text = append_turn(&committed_text, &text);
-                            active_turn.clear();
+                        TranscriptEvent::TurnEndedWithTranscript(chunk) => {
+                            if processed_finals.insert(chunk.dedupe_key()) {
+                                info!("deepgram turn ended with transcript: {}", chunk.text);
+                                process_finalized_segment(
+                                    &state_for_task,
+                                    &config,
+                                    &mut keyboard,
+                                    &llm_interpreter,
+                                    &mut committed_text,
+                                    &mut active_turn,
+                                    chunk,
+                                )
+                                .await;
+                            } else {
+                                committed_text = append_turn(&committed_text, &active_turn);
+                                active_turn.clear();
+                            }
                         }
                         TranscriptEvent::Warning(message) => {
                             warn!("deepgram warning: {}", message);
                             publish_status(
                                 &state_for_task,
-                                Some(DictationState::Error),
-                                None,
-                                None,
-                                Some(message),
+                                StatusUpdate {
+                                    state: Some(DictationState::Error),
+                                    last_error: Some(Some(message)),
+                                    ..StatusUpdate::default()
+                                },
                             )
                             .await;
                         }
@@ -319,7 +375,16 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                     }
                 }, if shutting_down => {
                     info!("deepgram shutdown grace period elapsed");
-                    publish_status(&state_for_task, Some(DictationState::Idle), None, None, None).await;
+                    publish_status(
+                        &state_for_task,
+                        StatusUpdate {
+                            state: Some(DictationState::Idle),
+                            partial_transcript: Some(None),
+                            intelligence_state: Some(None),
+                            ..StatusUpdate::default()
+                        },
+                    )
+                    .await;
                     break;
                 }
             }
@@ -329,6 +394,119 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
     let mut guard = state.session.lock().await;
     *guard = Some(RunningSession { stop_tx });
     Ok("Started dictation".to_string())
+}
+
+async fn process_finalized_segment(
+    state: &Arc<AppState>,
+    config: &AppConfig,
+    keyboard: &mut UInputKeyboard,
+    llm_interpreter: &Option<LlmInterpreter>,
+    committed_text: &mut String,
+    active_turn: &mut String,
+    chunk: TranscriptChunk,
+) {
+    let previous_rendered = render_transcript(committed_text, active_turn);
+
+    if let Some(interpreter) = llm_interpreter {
+        publish_status(
+            state,
+            StatusUpdate {
+                intelligence_state: Some(Some("Resolving segment".to_string())),
+                last_llm_error: Some(None),
+                ..StatusUpdate::default()
+            },
+        )
+        .await;
+
+        let request = SegmentDecisionRequest {
+            segment_id: uuid::Uuid::new_v4().to_string(),
+            finalized_text: chunk.text.clone(),
+            literal_text: chunk.text.clone(),
+            recent_text: recent_text_window(committed_text, config.intelligence.max_recent_chars),
+            action_scope: config.intelligence.action_scope.clone(),
+            command_mode: config.intelligence.command_mode.clone(),
+            text_output_mode: config.intelligence.text_output_mode.clone(),
+        };
+
+        match interpreter.decide(&request).await {
+            Ok(output) => {
+                let next_rendered =
+                    render_transcript(committed_text, &output.decision.text_to_emit);
+                apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+                if let Err(error) = keyboard.emit_actions(&output.decision.actions) {
+                    warn!("failed to emit intelligent action(s): {error}");
+                    publish_status(
+                        state,
+                        StatusUpdate {
+                            last_llm_error: Some(Some(format!("Action execution failed: {error}"))),
+                            intelligence_state: Some(Some("Action execution failed".to_string())),
+                            ..StatusUpdate::default()
+                        },
+                    )
+                    .await;
+                } else {
+                    publish_status(
+                        state,
+                        StatusUpdate {
+                            last_llm_error: Some(None),
+                            last_decision_kind: Some(Some(output.decision.kind.clone())),
+                            intelligence_state: Some(Some(format!(
+                                "Decision: {}",
+                                output.decision.kind.as_label()
+                            ))),
+                            ..StatusUpdate::default()
+                        },
+                    )
+                    .await;
+                }
+
+                *committed_text = next_rendered;
+                active_turn.clear();
+                return;
+            }
+            Err(error) => {
+                warn!("llm interpretation failed: {error}");
+                publish_status(
+                    state,
+                    StatusUpdate {
+                        last_llm_error: Some(Some(error.to_string())),
+                        last_decision_kind: Some(None),
+                        intelligence_state: Some(Some("Literal fallback".to_string())),
+                        ..StatusUpdate::default()
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    let next_rendered = render_transcript(committed_text, &chunk.text);
+    apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+    *committed_text = next_rendered;
+    active_turn.clear();
+}
+
+async fn load_llm_interpreter(
+    config: &AppConfig,
+    secret_store: &SecretStore,
+) -> Result<Option<LlmInterpreter>> {
+    if !config.intelligence.enabled {
+        return Ok(None);
+    }
+
+    if config.intelligence.base_url.trim().is_empty() || config.intelligence.model.trim().is_empty()
+    {
+        return Ok(None);
+    }
+
+    let Some(api_key) = secret_store.get_llm_api_key().await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(LlmInterpreter::new(
+        config.intelligence.clone(),
+        api_key,
+    )?))
 }
 
 async fn apply_transcript(
@@ -344,6 +522,127 @@ async fn apply_transcript(
     status.partial_transcript = Some(latest.to_string());
     status.updated_at = Utc::now();
     state.overlay.push(status.clone());
+}
+
+async fn stop_dictation(state: Arc<AppState>) -> Result<String> {
+    let session = {
+        let mut guard = state.session.lock().await;
+        guard.take()
+    };
+    let Some(session) = session else {
+        return Ok("Dictation is not active".to_string());
+    };
+
+    let _ = session.stop_tx.send(());
+    publish_status(
+        &state,
+        StatusUpdate {
+            state: Some(DictationState::Idle),
+            partial_transcript: Some(None),
+            intelligence_state: Some(None),
+            ..StatusUpdate::default()
+        },
+    )
+    .await;
+    Ok("Stopped dictation".to_string())
+}
+
+async fn build_status(
+    state: &Arc<AppState>,
+    state_override: Option<DictationState>,
+    error: Option<String>,
+) -> DaemonStatus {
+    let config = state.config.read().await.clone();
+    let llm_ready = match SecretStore::connect().await {
+        Ok(store) if config.intelligence.enabled => store
+            .get_llm_api_key()
+            .await
+            .ok()
+            .flatten()
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false),
+        _ => false,
+    };
+
+    DaemonStatus {
+        state: state_override.unwrap_or(DictationState::Idle),
+        mic_ready: resolve_selected_device(&config).is_some(),
+        typing_ready: std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .is_ok(),
+        hotkey_ready: *state.hotkey_ready.read().await,
+        intelligence_ready: !config.intelligence.enabled || llm_ready,
+        llm_ready,
+        current_mic: config.selected_device.clone(),
+        partial_transcript: None,
+        last_error: error,
+        last_llm_error: None,
+        last_decision_kind: None,
+        intelligence_state: if config.intelligence.enabled {
+            Some(if llm_ready {
+                "Interpreter ready".to_string()
+            } else {
+                "Literal fallback".to_string()
+            })
+        } else {
+            Some("Intelligence disabled".to_string())
+        },
+        updated_at: Utc::now(),
+    }
+}
+
+async fn sync_status(
+    state: Arc<AppState>,
+    state_override: Option<DictationState>,
+    error: Option<String>,
+) -> Result<()> {
+    let mut status = build_status(&state, state_override, error).await;
+    let existing = state.status.read().await.clone();
+    status.partial_transcript = existing.partial_transcript;
+    status.last_llm_error = existing.last_llm_error;
+    status.last_decision_kind = existing.last_decision_kind;
+    status.intelligence_state = existing.intelligence_state.or(status.intelligence_state);
+    state.overlay.push(status.clone());
+    *state.status.write().await = status;
+    Ok(())
+}
+
+async fn publish_status(state: &Arc<AppState>, update: StatusUpdate) {
+    let mut status = state.status.write().await.clone();
+
+    if let Some(next_state) = update.state {
+        status.state = next_state;
+    }
+    if let Some(mic) = update.current_mic {
+        status.current_mic = mic;
+    }
+    if let Some(partial) = update.partial_transcript {
+        status.partial_transcript = partial;
+    }
+    if let Some(last_error) = update.last_error {
+        status.last_error = last_error;
+    }
+    if let Some(intelligence_ready) = update.intelligence_ready {
+        status.intelligence_ready = intelligence_ready;
+    }
+    if let Some(llm_ready) = update.llm_ready {
+        status.llm_ready = llm_ready;
+    }
+    if let Some(last_llm_error) = update.last_llm_error {
+        status.last_llm_error = last_llm_error;
+    }
+    if let Some(last_decision_kind) = update.last_decision_kind {
+        status.last_decision_kind = last_decision_kind;
+    }
+    if let Some(intelligence_state) = update.intelligence_state {
+        status.intelligence_state = intelligence_state;
+    }
+
+    status.updated_at = Utc::now();
+
+    state.overlay.push(status.clone());
+    *state.status.write().await = status;
 }
 
 fn render_transcript(committed: &str, active_turn: &str) -> String {
@@ -380,79 +679,12 @@ fn needs_separator(left: &str, right: &str) -> bool {
     }
 }
 
-async fn stop_dictation(state: Arc<AppState>) -> Result<String> {
-    let session = {
-        let mut guard = state.session.lock().await;
-        guard.take()
-    };
-    let Some(session) = session else {
-        return Ok("Dictation is not active".to_string());
-    };
-
-    let _ = session.stop_tx.send(());
-    publish_status(&state, Some(DictationState::Idle), None, None, None).await;
-    Ok("Stopped dictation".to_string())
-}
-
-async fn build_status(
-    state: &Arc<AppState>,
-    state_override: Option<DictationState>,
-    error: Option<String>,
-) -> DaemonStatus {
-    let config = state.config.read().await.clone();
-    DaemonStatus {
-        state: state_override.unwrap_or(DictationState::Idle),
-        mic_ready: resolve_selected_device(&config).is_some(),
-        typing_ready: std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/uinput")
-            .is_ok(),
-        hotkey_ready: *state.hotkey_ready.read().await,
-        current_mic: config.selected_device.clone(),
-        partial_transcript: None,
-        last_error: error,
-        updated_at: Utc::now(),
+fn recent_text_window(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
     }
-}
 
-async fn sync_status(
-    state: Arc<AppState>,
-    state_override: Option<DictationState>,
-    error: Option<String>,
-) -> Result<()> {
-    let mut status = build_status(&state, state_override, error).await;
-    if let Some(existing) = state.status.read().await.partial_transcript.clone() {
-        status.partial_transcript = Some(existing);
-    }
-    state.overlay.push(status.clone());
-    *state.status.write().await = status;
-    Ok(())
-}
-
-async fn publish_status(
-    state: &Arc<AppState>,
-    state_override: Option<DictationState>,
-    current_mic: Option<wispr_core::DeviceChoice>,
-    partial_transcript: Option<String>,
-    error: Option<String>,
-) {
-    let mut status = state.status.write().await.clone();
-    let is_idle = matches!(state_override.as_ref(), Some(DictationState::Idle));
-
-    if let Some(next_state) = state_override {
-        status.state = next_state;
-    }
-    if let Some(mic) = current_mic {
-        status.current_mic = Some(mic);
-    }
-    if let Some(partial) = partial_transcript {
-        status.partial_transcript = Some(partial);
-    } else if is_idle {
-        status.partial_transcript = None;
-    }
-    status.last_error = error;
-    status.updated_at = Utc::now();
-
-    state.overlay.push(status.clone());
-    *state.status.write().await = status;
+    let chars = text.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(max_chars);
+    chars[start..].iter().collect()
 }

@@ -2,8 +2,10 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 use wispr_core::{
-    DictationProxy, Result,
+    AppConfig, CommandMode, DictationProxy, LlmInterpreter, Result, SegmentDecisionRequest,
+    TextOutputMode,
     install::{install_uinput_rule, write_default_config, write_user_service},
+    secrets::SecretStore,
 };
 
 #[derive(Parser)]
@@ -27,6 +29,10 @@ enum Command {
     },
     InstallAutostart,
     WriteDefaultConfig,
+    TestLlm {
+        #[arg(default_value = "hello enter")]
+        text: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -60,9 +66,40 @@ async fn main() -> Result<()> {
         Command::WriteDefaultConfig => {
             println!("{}", write_default_config()?);
         }
+        Command::TestLlm { text } => {
+            println!("{}", test_llm(&text).await?);
+        }
     }
 
     Ok(())
+}
+
+async fn test_llm(text: &str) -> Result<String> {
+    let config = AppConfig::load()?;
+    let secret_store = SecretStore::connect().await?;
+    let api_key = secret_store.get_llm_api_key().await?.ok_or_else(|| {
+        wispr_core::WisprError::InvalidState("no LLM API key is configured".to_string())
+    })?;
+    let interpreter = LlmInterpreter::new(config.intelligence.clone(), api_key)?;
+    let output = interpreter
+        .decide(&SegmentDecisionRequest {
+            segment_id: "wisprctl-test".to_string(),
+            finalized_text: text.to_string(),
+            literal_text: text.to_string(),
+            recent_text: String::new(),
+            action_scope: config.intelligence.action_scope.clone(),
+            command_mode: CommandMode::AlwaysInfer,
+            text_output_mode: TextOutputMode::Literal,
+        })
+        .await?;
+
+    Ok(format!(
+        "decision={} text_to_emit={:?} actions={:?} raw={}",
+        output.decision.kind.as_label(),
+        output.decision.text_to_emit,
+        output.decision.actions,
+        output.streamed_text
+    ))
 }
 
 async fn daemon_call<F>(call: F) -> Result<String>
