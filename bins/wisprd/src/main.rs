@@ -1,3 +1,4 @@
+mod app_context;
 mod audio;
 mod deepgram;
 mod overlay;
@@ -14,7 +15,8 @@ use tracing::{error, info, warn};
 use wispr_core::{
     AppConfig, CorrectionScope, DecisionKind, FormattingTriggerPolicy, LlmInterpreter,
     PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
-    models::{DaemonStatus, DeviceChoice, DictationState, FormatKind},
+    models::{ActiveAppContext, DaemonStatus, DeviceChoice, DictationState, FormatKind},
+    resolve_actions,
     secrets::SecretStore,
     typing::{UInputKeyboard, diff_patch},
 };
@@ -52,6 +54,8 @@ struct StatusUpdate {
     last_llm_error: Option<Option<String>>,
     last_decision_kind: Option<Option<DecisionKind>>,
     intelligence_state: Option<Option<String>>,
+    active_app: Option<Option<ActiveAppContext>>,
+    last_resolution: Option<Option<String>>,
 }
 
 struct DictationDbus {
@@ -222,6 +226,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
             } else {
                 "Intelligence disabled".to_string()
             })),
+            active_app: Some(None),
+            last_resolution: Some(None),
         },
     )
     .await;
@@ -299,6 +305,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 state: Some(DictationState::Idle),
                                 partial_transcript: Some(None),
                                 intelligence_state: Some(None),
+                                active_app: Some(None),
+                                last_resolution: Some(None),
                                 ..StatusUpdate::default()
                             },
                         )
@@ -406,6 +414,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                             state: Some(DictationState::Idle),
                             partial_transcript: Some(None),
                             intelligence_state: Some(None),
+                            active_app: Some(None),
+                            last_resolution: Some(None),
                             ..StatusUpdate::default()
                         },
                     )
@@ -463,10 +473,53 @@ async fn process_finalized_segment(
             preferred_list_style: PreferredListStyle::Numbered,
             formatting_trigger_policy: FormattingTriggerPolicy::ClearStructureOnly,
             correction_scope: CorrectionScope::CurrentBlockOnly,
+            active_app: app_context::detect_active_app().await,
         };
+
+        publish_status(
+            state,
+            StatusUpdate {
+                active_app: Some(request.active_app.clone()),
+                last_resolution: Some(None),
+                ..StatusUpdate::default()
+            },
+        )
+        .await;
 
         match interpreter.decide(&request).await {
             Ok(output) => {
+                let resolved_actions = match resolve_actions(
+                    &config.intelligence,
+                    &output.decision.actions,
+                    request.active_app.as_ref(),
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        warn!("action resolution failed: {error}");
+                        publish_status(
+                            state,
+                            StatusUpdate {
+                                last_llm_error: Some(Some(error.to_string())),
+                                last_decision_kind: Some(None),
+                                intelligence_state: Some(Some("Literal fallback".to_string())),
+                                last_resolution: Some(None),
+                                ..StatusUpdate::default()
+                            },
+                        )
+                        .await;
+                        let next_rendered = render_literal_fallback(
+                            committed_prefix,
+                            active_block.as_ref(),
+                            &chunk.text,
+                        );
+                        apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+                        *committed_prefix = next_rendered;
+                        *active_block = None;
+                        active_turn.clear();
+                        return;
+                    }
+                };
+
                 let next_rendered = match output.decision.rewrite_scope {
                     RewriteScope::CurrentBlock => render_transcript(
                         committed_prefix,
@@ -486,14 +539,15 @@ async fn process_finalized_segment(
                 };
                 apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
                 let closes_block =
-                    !output.decision.actions.is_empty() || !output.decision.keep_block_open;
-                if let Err(error) = keyboard.emit_actions(&output.decision.actions) {
+                    !resolved_actions.actions.is_empty() || !output.decision.keep_block_open;
+                if let Err(error) = keyboard.emit_actions(&resolved_actions.actions) {
                     warn!("failed to emit intelligent action(s): {error}");
                     publish_status(
                         state,
                         StatusUpdate {
                             last_llm_error: Some(Some(format!("Action execution failed: {error}"))),
                             intelligence_state: Some(Some("Action execution failed".to_string())),
+                            last_resolution: Some(None),
                             ..StatusUpdate::default()
                         },
                     )
@@ -511,6 +565,9 @@ async fn process_finalized_segment(
                             last_llm_error: Some(None),
                             last_decision_kind: Some(Some(output.decision.kind.clone())),
                             intelligence_state: Some(intelligence_state),
+                            last_resolution: Some(
+                                resolved_actions.description.map(|description| description),
+                            ),
                             ..StatusUpdate::default()
                         },
                     )
@@ -637,6 +694,8 @@ async fn stop_dictation(state: Arc<AppState>) -> Result<String> {
             state: Some(DictationState::Idle),
             partial_transcript: Some(None),
             intelligence_state: Some(None),
+            active_app: Some(None),
+            last_resolution: Some(None),
             ..StatusUpdate::default()
         },
     )
@@ -685,6 +744,8 @@ async fn build_status(
         } else {
             Some("Intelligence disabled".to_string())
         },
+        active_app: None,
+        last_resolution: None,
         updated_at: Utc::now(),
     }
 }
@@ -700,6 +761,8 @@ async fn sync_status(
     status.last_llm_error = existing.last_llm_error;
     status.last_decision_kind = existing.last_decision_kind;
     status.intelligence_state = existing.intelligence_state.or(status.intelligence_state);
+    status.active_app = existing.active_app;
+    status.last_resolution = existing.last_resolution;
     state.overlay.push(status.clone());
     *state.status.write().await = status;
     Ok(())
@@ -734,6 +797,12 @@ async fn publish_status(state: &Arc<AppState>, update: StatusUpdate) {
     }
     if let Some(intelligence_state) = update.intelligence_state {
         status.intelligence_state = intelligence_state;
+    }
+    if let Some(active_app) = update.active_app {
+        status.active_app = active_app;
+    }
+    if let Some(last_resolution) = update.last_resolution {
+        status.last_resolution = last_resolution;
     }
 
     status.updated_at = Utc::now();

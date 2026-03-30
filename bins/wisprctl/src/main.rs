@@ -2,9 +2,11 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 use wispr_core::{
-    AppConfig, CommandMode, CorrectionScope, DictationProxy, FormattingTriggerPolicy,
-    LlmInterpreter, PreferredListStyle, Result, SegmentDecisionRequest, TextOutputMode,
+    ActiveAppClass, ActiveAppContext, AppConfig, CommandMode, CorrectionScope, DictationProxy,
+    FormattingTriggerPolicy, LlmInterpreter, PreferredListStyle, Result, SegmentDecisionRequest,
+    TextOutputMode,
     install::{install_uinput_rule, write_default_config, write_user_service},
+    resolve_actions,
     secrets::SecretStore,
 };
 
@@ -32,6 +34,10 @@ enum Command {
     TestLlm {
         #[arg(default_value = "hello enter")]
         text: String,
+        #[arg(long)]
+        app_class: Option<String>,
+        #[arg(long)]
+        app_id: Option<String>,
     },
 }
 
@@ -66,21 +72,29 @@ async fn main() -> Result<()> {
         Command::WriteDefaultConfig => {
             println!("{}", write_default_config()?);
         }
-        Command::TestLlm { text } => {
-            println!("{}", test_llm(&text).await?);
+        Command::TestLlm {
+            text,
+            app_class,
+            app_id,
+        } => {
+            println!(
+                "{}",
+                test_llm(&text, app_class.as_deref(), app_id.as_deref()).await?
+            );
         }
     }
 
     Ok(())
 }
 
-async fn test_llm(text: &str) -> Result<String> {
+async fn test_llm(text: &str, app_class: Option<&str>, app_id: Option<&str>) -> Result<String> {
     let config = AppConfig::load()?;
     let secret_store = SecretStore::connect().await?;
     let api_key = secret_store.get_llm_api_key().await?.ok_or_else(|| {
         wispr_core::WisprError::InvalidState("no LLM API key is configured".to_string())
     })?;
     let interpreter = LlmInterpreter::new(config.intelligence.clone(), api_key)?;
+    let active_app = build_active_app(app_class, app_id)?;
     let output = interpreter
         .decide(&SegmentDecisionRequest {
             segment_id: "wisprctl-test".to_string(),
@@ -95,19 +109,55 @@ async fn test_llm(text: &str) -> Result<String> {
             preferred_list_style: PreferredListStyle::Numbered,
             formatting_trigger_policy: FormattingTriggerPolicy::ClearStructureOnly,
             correction_scope: CorrectionScope::CurrentBlockOnly,
+            active_app: active_app.clone(),
         })
         .await?;
+    let resolved = resolve_actions(
+        &config.intelligence,
+        &output.decision.actions,
+        active_app.as_ref(),
+    );
 
     Ok(format!(
-        "decision={} rewrite_scope={:?} format_kind={:?} keep_block_open={} text_to_emit={:?} actions={:?} raw={}",
+        "decision={} rewrite_scope={:?} format_kind={:?} keep_block_open={} text_to_emit={:?} actions={:?} resolved={} raw={}",
         output.decision.kind.as_label(),
         output.decision.rewrite_scope,
         output.decision.format_kind,
         output.decision.keep_block_open,
         output.decision.text_to_emit,
         output.decision.actions,
+        match resolved {
+            Ok(actions) => format!("{:?} ({:?})", actions.actions, actions.description),
+            Err(error) => format!("ERR({error})"),
+        },
         output.streamed_text
     ))
+}
+
+fn build_active_app(
+    app_class: Option<&str>,
+    app_id: Option<&str>,
+) -> Result<Option<ActiveAppContext>> {
+    let Some(app_class) = app_class else {
+        return Ok(None);
+    };
+
+    let app_class = match app_class.trim().to_ascii_lowercase().as_str() {
+        "browser" => ActiveAppClass::Browser,
+        "editor" => ActiveAppClass::Editor,
+        "terminal" => ActiveAppClass::Terminal,
+        "generic" => ActiveAppClass::Generic,
+        other => {
+            return Err(wispr_core::WisprError::InvalidState(format!(
+                "unsupported app class: {other}"
+            )));
+        }
+    };
+
+    Ok(Some(ActiveAppContext {
+        app_class,
+        app_id: app_id.map(ToString::to_string),
+    }))
 }
 
 async fn daemon_call<F>(call: F) -> Result<String>

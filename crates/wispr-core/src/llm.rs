@@ -9,8 +9,8 @@ use crate::{
     config::IntelligenceConfig,
     error::{Result, WisprError},
     models::{
-        ActionCommand, ActionKey, ActionScope, ActionType, CommandMode, CorrectionScope,
-        DecisionKind, FormattingTriggerPolicy, ModifierKey, PreferredListStyle, SegmentDecision,
+        ActionCommand, ActionScope, ActionType, CommandMode, CorrectionScope, DecisionKind,
+        FormattingTriggerPolicy, ModifierKey, PreferredListStyle, SegmentDecision,
         SegmentDecisionRequest, TextOutputMode,
     },
 };
@@ -55,6 +55,7 @@ impl LlmInterpreter {
             preferred_list_style: PreferredListStyle::Numbered,
             formatting_trigger_policy: FormattingTriggerPolicy::ClearStructureOnly,
             correction_scope: CorrectionScope::CurrentBlockOnly,
+            active_app: None,
         })
         .await
     }
@@ -287,7 +288,7 @@ fn build_request_body(
 }
 
 fn developer_prompt() -> &'static str {
-    "You are Wispr, a safe dictation command interpreter and formatter. You receive one finalized spoken segment, recent typed context, and optionally the current active formatting block. Return strict JSON only. Keep ordinary prose literal unless structure is explicit or very strong. Prefer numbered lists for sequential speech. Use bullet lists only when the speech is clearly unordered. Spoken corrections such as 'wait', 'no', 'not X, Y instead', or 'replace the third one' should usually rewrite the current block, not append a new literal sentence. rewrite_scope='segment' means only the current finalized segment should be committed. rewrite_scope='current_block' means text_to_emit is the full replacement for the active formatting block. keep_block_open should stay true while the user is still building or correcting the same list or note block. Allowed special keys: Space, Enter, Tab, Escape, Backspace, Delete, Left, Right, Up, Down, Home, End, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12. Allowed shortcuts: Ctrl+A, Ctrl+C, Ctrl+V, Ctrl+X, Ctrl+Z, Ctrl+Shift+Z. Each action may set repeat to run the same key multiple times, such as Space repeated twice. Never invent actions. Never launch apps, run shell commands, click, move the mouse, or use unsupported shortcuts. If the spoken text is ordinary prose, return kind literal, format_kind plain, rewrite_scope segment, and keep text_to_emit equal to the literal transcript. If command words should not remain in the editor, remove them from text_to_emit. Normalize command-like text when the user is dictating shell commands or flags: for example 'flutter dash dash version enter' should become text_to_emit 'flutter --version' plus Enter. Example formatting behavior: a spoken to-do list should become a numbered list; a later correction like 'wait, not housecleaning, washing of clothes' should rewrite the current list block so the corrected item replaces the old one."
+    "You are Wispr, a safe dictation command interpreter and formatter. You receive one finalized spoken segment, recent typed context, an optional active formatting block, and optional active app context. Return strict JSON only. Keep ordinary prose literal unless structure is explicit or very strong. Prefer numbered lists for sequential speech. Use bullet lists only when the speech is clearly unordered. Spoken corrections such as 'wait', 'no', 'not X, Y instead', or 'replace the third one' should usually rewrite the current block, not append a new literal sentence. rewrite_scope='segment' means only the current finalized segment should be committed. rewrite_scope='current_block' means text_to_emit is the full replacement for the active formatting block. keep_block_open should stay true while the user is still building or correcting the same list or note block. You may emit explicit keyboard actions with modifiers Ctrl, Shift, Alt, and Super. You may also emit semantic_command actions for common app intents such as new_tab, close_tab, reopen_closed_tab, refresh, find, save, copy, paste, cut, undo, redo, focus_address_bar, next_tab, and previous_tab. Prefer semantic_command for high-level phrases like 'open a new browser tab' or 'focus the address bar'. If active app context is available, use it. Allowed keys include letters A-Z, digits Digit0-Digit9, Space, Enter, Tab, Escape, Backspace, Delete, Insert, Left, Right, Up, Down, Home, End, PageUp, PageDown, and F1-F12. Each action may set repeat to run the same key multiple times, such as Space repeated twice. Never invent dangerous system actions. Never launch apps, run shell commands, click, or move the mouse. If unsure, keep the speech literal. If the spoken text is ordinary prose, return kind literal, format_kind plain, rewrite_scope segment, and keep text_to_emit equal to the literal transcript. If command words should not remain in the editor, remove them from text_to_emit. Normalize command-like text when the user is dictating shell commands or flags: for example 'flutter dash dash version enter' should become text_to_emit 'flutter --version' plus Enter. Example formatting behavior: a spoken to-do list should become a numbered list; a later correction like 'wait, not housecleaning, washing of clothes' should rewrite the current list block so the corrected item replaces the old one."
 }
 
 fn decision_schema() -> Value {
@@ -319,27 +320,56 @@ fn decision_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["type", "key", "modifiers", "repeat"],
+                    "required": ["type", "key", "modifiers", "repeat", "command_id", "target_app"],
                     "properties": {
                         "type": {
                             "type": "string",
-                            "enum": ["key", "shortcut"]
+                            "enum": ["key", "shortcut", "semantic_command"]
                         },
                         "key": {
-                            "type": "string",
-                            "enum": ["Space", "Enter", "Tab", "Escape", "Backspace", "Delete", "Left", "Right", "Up", "Down", "Home", "End", "A", "C", "V", "X", "Z", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"]
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "enum": ["Space", "Enter", "Tab", "Escape", "Backspace", "Delete", "Insert", "Left", "Right", "Up", "Down", "Home", "End", "PageUp", "PageDown", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"]
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
                         },
                         "modifiers": {
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": ["Ctrl", "Shift"]
+                                "enum": ["Ctrl", "Shift", "Alt", "Super"]
                             }
                         },
                         "repeat": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 12
+                        },
+                        "command_id": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "enum": ["new_tab", "close_tab", "reopen_closed_tab", "refresh", "find", "save", "copy", "paste", "cut", "undo", "redo", "focus_address_bar", "next_tab", "previous_tab"]
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
+                        },
+                        "target_app": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "enum": ["browser", "editor", "terminal", "generic"]
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
                         }
                     }
                 }
@@ -496,13 +526,14 @@ fn should_retry_non_streaming(error: &WisprError) -> bool {
                 || message.contains("failed to parse streamed response event")
         }
         WisprError::InvalidState(message) => message.contains("returned no structured output"),
+        WisprError::Json(_) => true,
         _ => false,
     }
 }
 
 fn validate_decision(
     request: &SegmentDecisionRequest,
-    decision: SegmentDecision,
+    mut decision: SegmentDecision,
 ) -> Result<SegmentDecision> {
     if request.text_output_mode == TextOutputMode::Literal
         && decision.kind == DecisionKind::Literal
@@ -511,6 +542,7 @@ fn validate_decision(
         return Ok(SegmentDecision::literal(request.literal_text.clone()));
     }
 
+    hydrate_missing_actions(request, &mut decision);
     let normalized_text = normalize_command_text(&decision.text_to_emit);
 
     for action in &decision.actions {
@@ -532,6 +564,58 @@ fn validate_decision(
         text_to_emit: normalized_text,
         ..decision
     })
+}
+
+fn hydrate_missing_actions(request: &SegmentDecisionRequest, decision: &mut SegmentDecision) {
+    let inferred_key = infer_key_from_spoken_text(&request.finalized_text);
+    for action in &mut decision.actions {
+        if action.action_type == ActionType::Key
+            && action.key.is_none()
+            && action.command_id.is_none()
+        {
+            action.key = inferred_key.clone();
+        }
+    }
+}
+
+fn infer_key_from_spoken_text(text: &str) -> Option<crate::models::ActionKey> {
+    let normalized = text.trim().to_ascii_lowercase();
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+
+    let last = tokens.last().copied().unwrap_or_default();
+    match last {
+        "enter" | "return" => Some(crate::models::ActionKey::Enter),
+        "tab" => Some(crate::models::ActionKey::Tab),
+        "escape" | "esc" => Some(crate::models::ActionKey::Escape),
+        "backspace" => Some(crate::models::ActionKey::Backspace),
+        "delete" => Some(crate::models::ActionKey::Delete),
+        "space" => Some(crate::models::ActionKey::Space),
+        "left" => Some(crate::models::ActionKey::Left),
+        "right" => Some(crate::models::ActionKey::Right),
+        "up" => Some(crate::models::ActionKey::Up),
+        "down" => Some(crate::models::ActionKey::Down),
+        "home" => Some(crate::models::ActionKey::Home),
+        "end" => Some(crate::models::ActionKey::End),
+        _ => infer_function_key(last),
+    }
+}
+
+fn infer_function_key(token: &str) -> Option<crate::models::ActionKey> {
+    match token {
+        "f1" => Some(crate::models::ActionKey::F1),
+        "f2" => Some(crate::models::ActionKey::F2),
+        "f3" => Some(crate::models::ActionKey::F3),
+        "f4" => Some(crate::models::ActionKey::F4),
+        "f5" => Some(crate::models::ActionKey::F5),
+        "f6" => Some(crate::models::ActionKey::F6),
+        "f7" => Some(crate::models::ActionKey::F7),
+        "f8" => Some(crate::models::ActionKey::F8),
+        "f9" => Some(crate::models::ActionKey::F9),
+        "f10" => Some(crate::models::ActionKey::F10),
+        "f11" => Some(crate::models::ActionKey::F11),
+        "f12" => Some(crate::models::ActionKey::F12),
+        _ => None,
+    }
 }
 
 fn validate_action(action: &ActionCommand, scope: &ActionScope) -> Result<()> {
@@ -565,60 +649,18 @@ fn validate_editing_only_action(action: &ActionCommand) -> Result<()> {
         )));
     }
 
-    match action.key {
-        ActionKey::Space
-        | ActionKey::Enter
-        | ActionKey::Tab
-        | ActionKey::Escape
-        | ActionKey::Backspace
-        | ActionKey::Delete
-        | ActionKey::Left
-        | ActionKey::Right
-        | ActionKey::Up
-        | ActionKey::Down
-        | ActionKey::Home
-        | ActionKey::End
-        | ActionKey::F1
-        | ActionKey::F2
-        | ActionKey::F3
-        | ActionKey::F4
-        | ActionKey::F5
-        | ActionKey::F6
-        | ActionKey::F7
-        | ActionKey::F8
-        | ActionKey::F9
-        | ActionKey::F10
-        | ActionKey::F11
-        | ActionKey::F12 => {
-            if !modifiers.is_empty() {
-                return Err(WisprError::InvalidState(format!(
-                    "key action {} does not allow modifiers",
-                    describe_action(action)
-                )));
-            }
-        }
-        ActionKey::A | ActionKey::C | ActionKey::V | ActionKey::X => {
-            if modifiers != &[ModifierKey::Ctrl] {
-                return Err(WisprError::InvalidState(format!(
-                    "shortcut {} must use Ctrl only",
-                    describe_action(action)
-                )));
-            }
-        }
-        ActionKey::Z => {
-            if modifiers != &[ModifierKey::Ctrl]
-                && modifiers != &[ModifierKey::Ctrl, ModifierKey::Shift]
-            {
-                return Err(WisprError::InvalidState(format!(
-                    "shortcut {} must use Ctrl or Ctrl+Shift",
-                    describe_action(action)
-                )));
-            }
-        }
-    }
-
     match action.action_type {
         ActionType::Key => {
+            if action.key.is_none() {
+                return Err(WisprError::InvalidState(
+                    "key action is missing a primary key".to_string(),
+                ));
+            }
+            if action.command_id.is_some() {
+                return Err(WisprError::InvalidState(
+                    "key action cannot include a semantic command id".to_string(),
+                ));
+            }
             if !modifiers.is_empty() {
                 return Err(WisprError::InvalidState(format!(
                     "key action {} cannot carry modifiers",
@@ -627,11 +669,38 @@ fn validate_editing_only_action(action: &ActionCommand) -> Result<()> {
             }
         }
         ActionType::Shortcut => {
+            if action.key.is_none() {
+                return Err(WisprError::InvalidState(
+                    "shortcut action is missing a primary key".to_string(),
+                ));
+            }
+            if action.command_id.is_some() {
+                return Err(WisprError::InvalidState(
+                    "shortcut action cannot include a semantic command id".to_string(),
+                ));
+            }
             if modifiers.is_empty() {
                 return Err(WisprError::InvalidState(format!(
                     "shortcut {} requires at least one modifier",
                     describe_action(action)
                 )));
+            }
+        }
+        ActionType::SemanticCommand => {
+            if action.command_id.is_none() {
+                return Err(WisprError::InvalidState(
+                    "semantic command action is missing command_id".to_string(),
+                ));
+            }
+            if action.key.is_some() {
+                return Err(WisprError::InvalidState(
+                    "semantic command action cannot include a raw key".to_string(),
+                ));
+            }
+            if !modifiers.is_empty() {
+                return Err(WisprError::InvalidState(
+                    "semantic command action cannot include modifiers".to_string(),
+                ));
             }
         }
     }
@@ -640,6 +709,20 @@ fn validate_editing_only_action(action: &ActionCommand) -> Result<()> {
 }
 
 fn describe_action(action: &ActionCommand) -> String {
+    if let Some(command_id) = &action.command_id {
+        let target = action
+            .target_app
+            .as_ref()
+            .map(|target| format!(" for {:?}", target))
+            .unwrap_or_default();
+        let repeat = if action.repeat > 1 {
+            format!(" x{}", action.repeat)
+        } else {
+            String::new()
+        };
+        return format!("{:?}{target}{repeat}", command_id);
+    }
+
     let repeat = if action.repeat > 1 {
         format!(" x{}", action.repeat)
     } else {

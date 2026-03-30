@@ -113,6 +113,23 @@ fn build_ui(app: &adw::Application) {
         .show_peek_icon(true)
         .build();
     llm_api_key_entry.set_text(&load_llm_api_key().unwrap_or_default());
+    let dynamic_shortcuts_switch = gtk::Switch::builder()
+        .active(config.intelligence.dynamic_shortcuts_enabled)
+        .build();
+    let semantic_commands_switch = gtk::Switch::builder()
+        .active(config.intelligence.semantic_commands_enabled)
+        .build();
+    let denylist_profile_combo = gtk::ComboBoxText::new();
+    denylist_profile_combo.append(Some("minimal"), "Minimal");
+    denylist_profile_combo.set_active_id(Some("minimal"));
+    let allowlist_entry = gtk::Entry::builder()
+        .text(&config.intelligence.shortcut_allowlist.join(", "))
+        .placeholder_text("Ctrl+T, Ctrl+L")
+        .build();
+    let denylist_entry = gtk::Entry::builder()
+        .text(&config.intelligence.shortcut_denylist.join(", "))
+        .placeholder_text("Super+Left")
+        .build();
 
     intelligence_group.add(&row_with_widget(
         "Enable Intelligence",
@@ -126,6 +143,20 @@ fn build_ui(app: &adw::Application) {
         &llm_debug_switch,
     ));
     intelligence_group.add(&row_with_widget("LLM API Key", &llm_api_key_entry));
+    intelligence_group.add(&row_with_widget(
+        "Enable Dynamic Shortcuts",
+        &dynamic_shortcuts_switch,
+    ));
+    intelligence_group.add(&row_with_widget(
+        "Enable Semantic Commands",
+        &semantic_commands_switch,
+    ));
+    intelligence_group.add(&row_with_widget(
+        "Denylist Profile",
+        &denylist_profile_combo,
+    ));
+    intelligence_group.add(&row_with_widget("Shortcut Allowlist", &allowlist_entry));
+    intelligence_group.add(&row_with_widget("Shortcut Denylist", &denylist_entry));
 
     let actions_box = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -175,6 +206,11 @@ fn build_ui(app: &adw::Application) {
         let llm_timeout_entry = llm_timeout_entry.clone();
         let llm_debug_switch = llm_debug_switch.clone();
         let llm_api_key_entry = llm_api_key_entry.clone();
+        let dynamic_shortcuts_switch = dynamic_shortcuts_switch.clone();
+        let semantic_commands_switch = semantic_commands_switch.clone();
+        let denylist_profile_combo = denylist_profile_combo.clone();
+        let allowlist_entry = allowlist_entry.clone();
+        let denylist_entry = denylist_entry.clone();
 
         save_button.connect_clicked(move |_| {
             let mut config = AppConfig::load().unwrap_or_default();
@@ -186,6 +222,14 @@ fn build_ui(app: &adw::Application) {
             config.intelligence.model = llm_model_entry.text().to_string();
             config.intelligence.timeout_ms = llm_timeout_entry.value() as u64;
             config.intelligence.debug_overlay = llm_debug_switch.is_active();
+            config.intelligence.dynamic_shortcuts_enabled = dynamic_shortcuts_switch.is_active();
+            config.intelligence.semantic_commands_enabled = semantic_commands_switch.is_active();
+            config.intelligence.shortcut_denylist_profile =
+                parse_denylist_profile(denylist_profile_combo.active_id().as_deref());
+            config.intelligence.shortcut_allowlist =
+                parse_combo_list(allowlist_entry.text().as_str());
+            config.intelligence.shortcut_denylist =
+                parse_combo_list(denylist_entry.text().as_str());
 
             if let Some(active_id) = mic_combo.active_id() {
                 if let Some(device) = devices.iter().find(|device| device.node_name == active_id) {
@@ -233,6 +277,11 @@ fn build_ui(app: &adw::Application) {
         let llm_timeout_entry = llm_timeout_entry.clone();
         let llm_debug_switch = llm_debug_switch.clone();
         let llm_api_key_entry = llm_api_key_entry.clone();
+        let dynamic_shortcuts_switch = dynamic_shortcuts_switch.clone();
+        let semantic_commands_switch = semantic_commands_switch.clone();
+        let denylist_profile_combo = denylist_profile_combo.clone();
+        let allowlist_entry = allowlist_entry.clone();
+        let denylist_entry = denylist_entry.clone();
         test_llm_button.connect_clicked(move |_| {
             let mut config = AppConfig::load().unwrap_or_default();
             config.intelligence.enabled = intelligence_enabled.is_active();
@@ -240,6 +289,14 @@ fn build_ui(app: &adw::Application) {
             config.intelligence.model = llm_model_entry.text().to_string();
             config.intelligence.timeout_ms = llm_timeout_entry.value() as u64;
             config.intelligence.debug_overlay = llm_debug_switch.is_active();
+            config.intelligence.dynamic_shortcuts_enabled = dynamic_shortcuts_switch.is_active();
+            config.intelligence.semantic_commands_enabled = semantic_commands_switch.is_active();
+            config.intelligence.shortcut_denylist_profile =
+                parse_denylist_profile(denylist_profile_combo.active_id().as_deref());
+            config.intelligence.shortcut_allowlist =
+                parse_combo_list(allowlist_entry.text().as_str());
+            config.intelligence.shortcut_denylist =
+                parse_combo_list(denylist_entry.text().as_str());
 
             match test_llm(config, llm_api_key_entry.text().as_str()) {
                 Ok(message) => status_label.set_label(&message),
@@ -254,6 +311,22 @@ fn build_ui(app: &adw::Application) {
             .unwrap_or_else(|error| format!("Daemon status unavailable: {error}")),
     );
     window.present();
+}
+
+fn parse_combo_list(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_denylist_profile(value: Option<&str>) -> wispr_core::ShortcutDenylistProfile {
+    match value {
+        Some("minimal") | None => wispr_core::ShortcutDenylistProfile::Minimal,
+        Some(_) => wispr_core::ShortcutDenylistProfile::Minimal,
+    }
 }
 
 fn row_with_widget(title: &str, widget: &impl IsA<gtk::Widget>) -> adw::ActionRow {
@@ -380,7 +453,7 @@ fn enumerate_devices() -> Result<Vec<wispr_core::DeviceChoice>> {
 
 fn format_status(status: &DaemonStatus) -> String {
     format!(
-        "State: {:?} | Mic ready: {} | Typing ready: {} | Hotkey ready: {} | Intelligence ready: {} | LLM ready: {}{}{}{}{}",
+        "State: {:?} | Mic ready: {} | Typing ready: {} | Hotkey ready: {} | Intelligence ready: {} | LLM ready: {}{}{}{}{}{}{}",
         status.state,
         status.mic_ready,
         status.typing_ready,
@@ -406,6 +479,23 @@ fn format_status(status: &DaemonStatus) -> String {
             .last_error
             .as_ref()
             .map(|err| format!(" | Error: {err}"))
+            .unwrap_or_default(),
+        status
+            .active_app
+            .as_ref()
+            .map(|app| format!(
+                " | App: {:?}{}",
+                app.app_class,
+                app.app_id
+                    .as_ref()
+                    .map(|id| format!(" ({id})"))
+                    .unwrap_or_default()
+            ))
+            .unwrap_or_default(),
+        status
+            .last_resolution
+            .as_ref()
+            .map(|value| format!(" | Resolution: {value}"))
             .unwrap_or_default(),
     )
 }

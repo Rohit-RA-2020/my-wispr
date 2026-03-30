@@ -78,11 +78,18 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .build();
+    let context_label = gtk::Label::builder()
+        .xalign(0.0)
+        .halign(Align::Start)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
 
     container.append(&state_label);
     container.append(&mic_label);
     container.append(&transcript_label);
     container.append(&intelligence_label);
+    container.append(&context_label);
     window.set_child(Some(&container));
 
     glib::timeout_add_local(Duration::from_millis(60), move || {
@@ -110,6 +117,33 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
                 .as_ref()
                 .map(|state| format!("Intelligence: {state}"))
                 .unwrap_or_default(),
+        );
+        context_label.set_label(
+            &status
+                .active_app
+                .as_ref()
+                .map(|app| {
+                    format!(
+                        "App: {:?}{}{}",
+                        app.app_class,
+                        app.app_id
+                            .as_ref()
+                            .map(|id| format!(" ({id})"))
+                            .unwrap_or_default(),
+                        status
+                            .last_resolution
+                            .as_ref()
+                            .map(|resolution| format!(" | Resolved: {resolution}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    status
+                        .last_resolution
+                        .as_ref()
+                        .map(|resolution| format!("Resolved: {resolution}"))
+                        .unwrap_or_default()
+                }),
         );
 
         if matches!(status.state, DictationState::Idle) {

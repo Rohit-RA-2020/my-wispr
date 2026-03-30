@@ -86,27 +86,21 @@ impl UInputKeyboard {
     }
 
     fn emit_action(&mut self, action: &ActionCommand) -> Result<()> {
-        let key = map_action_key(&action.key);
-        let ctrl = action.modifiers.contains(&ModifierKey::Ctrl);
-        let shift = action.modifiers.contains(&ModifierKey::Shift);
+        let key = map_action_key(action.key.as_ref().ok_or_else(|| {
+            WisprError::InvalidState("resolved action is missing a primary key".to_string())
+        })?);
         let repeat = action.repeat.max(1);
 
         for _ in 0..repeat {
-            if ctrl {
-                self.emit_key(KeyCode::KEY_LEFTCTRL, 1)?;
-            }
-            if shift {
-                self.emit_key(KeyCode::KEY_LEFTSHIFT, 1)?;
+            for modifier in modifier_press_order(&action.modifiers) {
+                self.emit_key(modifier, 1)?;
             }
 
             self.emit_key(key, 1)?;
             self.emit_key(key, 0)?;
 
-            if shift {
-                self.emit_key(KeyCode::KEY_LEFTSHIFT, 0)?;
-            }
-            if ctrl {
-                self.emit_key(KeyCode::KEY_LEFTCTRL, 0)?;
+            for modifier in modifier_release_order(&action.modifiers) {
+                self.emit_key(modifier, 0)?;
             }
 
             self.sync_delay();
@@ -156,17 +150,51 @@ fn map_action_key(key: &ActionKey) -> KeyCode {
         ActionKey::Escape => KeyCode::KEY_ESC,
         ActionKey::Backspace => KeyCode::KEY_BACKSPACE,
         ActionKey::Delete => KeyCode::KEY_DELETE,
+        ActionKey::Insert => KeyCode::KEY_INSERT,
         ActionKey::Left => KeyCode::KEY_LEFT,
         ActionKey::Right => KeyCode::KEY_RIGHT,
         ActionKey::Up => KeyCode::KEY_UP,
         ActionKey::Down => KeyCode::KEY_DOWN,
         ActionKey::Home => KeyCode::KEY_HOME,
         ActionKey::End => KeyCode::KEY_END,
+        ActionKey::PageUp => KeyCode::KEY_PAGEUP,
+        ActionKey::PageDown => KeyCode::KEY_PAGEDOWN,
         ActionKey::A => KeyCode::KEY_A,
+        ActionKey::B => KeyCode::KEY_B,
         ActionKey::C => KeyCode::KEY_C,
+        ActionKey::D => KeyCode::KEY_D,
+        ActionKey::E => KeyCode::KEY_E,
+        ActionKey::F => KeyCode::KEY_F,
+        ActionKey::G => KeyCode::KEY_G,
+        ActionKey::H => KeyCode::KEY_H,
+        ActionKey::I => KeyCode::KEY_I,
+        ActionKey::J => KeyCode::KEY_J,
+        ActionKey::K => KeyCode::KEY_K,
+        ActionKey::L => KeyCode::KEY_L,
+        ActionKey::M => KeyCode::KEY_M,
+        ActionKey::N => KeyCode::KEY_N,
+        ActionKey::O => KeyCode::KEY_O,
+        ActionKey::P => KeyCode::KEY_P,
+        ActionKey::Q => KeyCode::KEY_Q,
+        ActionKey::R => KeyCode::KEY_R,
+        ActionKey::S => KeyCode::KEY_S,
+        ActionKey::T => KeyCode::KEY_T,
+        ActionKey::U => KeyCode::KEY_U,
         ActionKey::V => KeyCode::KEY_V,
+        ActionKey::W => KeyCode::KEY_W,
         ActionKey::X => KeyCode::KEY_X,
+        ActionKey::Y => KeyCode::KEY_Y,
         ActionKey::Z => KeyCode::KEY_Z,
+        ActionKey::Digit0 => KeyCode::KEY_0,
+        ActionKey::Digit1 => KeyCode::KEY_1,
+        ActionKey::Digit2 => KeyCode::KEY_2,
+        ActionKey::Digit3 => KeyCode::KEY_3,
+        ActionKey::Digit4 => KeyCode::KEY_4,
+        ActionKey::Digit5 => KeyCode::KEY_5,
+        ActionKey::Digit6 => KeyCode::KEY_6,
+        ActionKey::Digit7 => KeyCode::KEY_7,
+        ActionKey::Digit8 => KeyCode::KEY_8,
+        ActionKey::Digit9 => KeyCode::KEY_9,
         ActionKey::F1 => KeyCode::KEY_F1,
         ActionKey::F2 => KeyCode::KEY_F2,
         ActionKey::F3 => KeyCode::KEY_F3,
@@ -184,6 +212,36 @@ fn map_action_key(key: &ActionKey) -> KeyCode {
 
 fn map_io(error: io::Error) -> WisprError {
     WisprError::Io(error)
+}
+
+fn modifier_press_order(modifiers: &[ModifierKey]) -> Vec<KeyCode> {
+    let mut ordered = Vec::new();
+    for modifier in [
+        ModifierKey::Ctrl,
+        ModifierKey::Shift,
+        ModifierKey::Alt,
+        ModifierKey::Super,
+    ] {
+        if modifiers.contains(&modifier) {
+            ordered.push(map_modifier_key(&modifier));
+        }
+    }
+    ordered
+}
+
+fn modifier_release_order(modifiers: &[ModifierKey]) -> Vec<KeyCode> {
+    let mut ordered = modifier_press_order(modifiers);
+    ordered.reverse();
+    ordered
+}
+
+fn map_modifier_key(key: &ModifierKey) -> KeyCode {
+    match key {
+        ModifierKey::Ctrl => KeyCode::KEY_LEFTCTRL,
+        ModifierKey::Shift => KeyCode::KEY_LEFTSHIFT,
+        ModifierKey::Alt => KeyCode::KEY_LEFTALT,
+        ModifierKey::Super => KeyCode::KEY_LEFTMETA,
+    }
 }
 
 fn supported_keys() -> Vec<KeyCode> {
@@ -249,14 +307,19 @@ fn supported_keys() -> Vec<KeyCode> {
         KeyCode::KEY_TAB,
         KeyCode::KEY_ESC,
         KeyCode::KEY_DELETE,
+        KeyCode::KEY_INSERT,
         KeyCode::KEY_LEFT,
         KeyCode::KEY_RIGHT,
         KeyCode::KEY_UP,
         KeyCode::KEY_DOWN,
         KeyCode::KEY_HOME,
         KeyCode::KEY_END,
+        KeyCode::KEY_PAGEUP,
+        KeyCode::KEY_PAGEDOWN,
         KeyCode::KEY_LEFTSHIFT,
         KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_LEFTMETA,
     ]
 }
 

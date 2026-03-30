@@ -94,12 +94,15 @@ impl DecisionKind {
 pub enum ActionType {
     Key,
     Shortcut,
+    SemanticCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ModifierKey {
     Ctrl,
     Shift,
+    Alt,
+    Super,
 }
 
 impl ModifierKey {
@@ -107,6 +110,8 @@ impl ModifierKey {
         match self {
             Self::Ctrl => "Ctrl",
             Self::Shift => "Shift",
+            Self::Alt => "Alt",
+            Self::Super => "Super",
         }
     }
 }
@@ -119,17 +124,51 @@ pub enum ActionKey {
     Escape,
     Backspace,
     Delete,
+    Insert,
     Left,
     Right,
     Up,
     Down,
     Home,
     End,
+    PageUp,
+    PageDown,
     A,
+    B,
     C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
     V,
+    W,
     X,
+    Y,
     Z,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
     F1,
     F2,
     F3,
@@ -142,6 +181,60 @@ pub enum ActionKey {
     F10,
     F11,
     F12,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveAppClass {
+    Browser,
+    Editor,
+    Terminal,
+    Generic,
+}
+
+impl Default for ActiveAppClass {
+    fn default() -> Self {
+        Self::Generic
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActiveAppContext {
+    #[serde(default)]
+    pub app_class: ActiveAppClass,
+    #[serde(default)]
+    pub app_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCommandId {
+    NewTab,
+    CloseTab,
+    ReopenClosedTab,
+    Refresh,
+    Find,
+    Save,
+    Copy,
+    Paste,
+    Cut,
+    Undo,
+    Redo,
+    FocusAddressBar,
+    NextTab,
+    PreviousTab,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutDenylistProfile {
+    Minimal,
+}
+
+impl Default for ShortcutDenylistProfile {
+    fn default() -> Self {
+        Self::Minimal
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,11 +304,16 @@ impl Default for CorrectionScope {
 pub struct ActionCommand {
     #[serde(rename = "type")]
     pub action_type: ActionType,
-    pub key: ActionKey,
+    #[serde(default)]
+    pub key: Option<ActionKey>,
     #[serde(default)]
     pub modifiers: Vec<ModifierKey>,
     #[serde(default = "default_repeat")]
     pub repeat: u8,
+    #[serde(default)]
+    pub command_id: Option<SemanticCommandId>,
+    #[serde(default)]
+    pub target_app: Option<ActiveAppClass>,
 }
 
 fn default_repeat() -> u8 {
@@ -268,6 +366,8 @@ pub struct SegmentDecisionRequest {
     pub formatting_trigger_policy: FormattingTriggerPolicy,
     #[serde(default)]
     pub correction_scope: CorrectionScope,
+    #[serde(default)]
+    pub active_app: Option<ActiveAppContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +384,8 @@ pub struct DaemonStatus {
     pub last_llm_error: Option<String>,
     pub last_decision_kind: Option<DecisionKind>,
     pub intelligence_state: Option<String>,
+    pub active_app: Option<ActiveAppContext>,
+    pub last_resolution: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -302,6 +404,8 @@ impl Default for DaemonStatus {
             last_llm_error: None,
             last_decision_kind: None,
             intelligence_state: None,
+            active_app: None,
+            last_resolution: None,
             updated_at: Utc::now(),
         }
     }

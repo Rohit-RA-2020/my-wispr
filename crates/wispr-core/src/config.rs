@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Result, WisprError},
-    models::{ActionScope, CommandMode, DeviceChoice, HotkeyBinding, TextOutputMode},
+    models::{
+        ActionScope, CommandMode, DeviceChoice, HotkeyBinding, ShortcutDenylistProfile,
+        TextOutputMode,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +57,11 @@ pub struct IntelligenceConfig {
     pub text_output_mode: TextOutputMode,
     pub action_scope: ActionScope,
     pub debug_overlay: bool,
+    pub dynamic_shortcuts_enabled: bool,
+    pub semantic_commands_enabled: bool,
+    pub shortcut_denylist_profile: ShortcutDenylistProfile,
+    pub shortcut_allowlist: Vec<String>,
+    pub shortcut_denylist: Vec<String>,
 }
 
 impl Default for IntelligenceConfig {
@@ -68,6 +76,11 @@ impl Default for IntelligenceConfig {
             text_output_mode: TextOutputMode::Literal,
             action_scope: ActionScope::EditingOnly,
             debug_overlay: true,
+            dynamic_shortcuts_enabled: true,
+            semantic_commands_enabled: true,
+            shortcut_denylist_profile: ShortcutDenylistProfile::Minimal,
+            shortcut_allowlist: Vec::new(),
+            shortcut_denylist: Vec::new(),
         }
     }
 }
