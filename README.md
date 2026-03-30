@@ -1,6 +1,6 @@
 # Wispr
 
-Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types the transcript into the currently focused application through a virtual keyboard.
+Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions instead of literal text.
 
 This repository currently targets Ubuntu GNOME on Wayland.
 
@@ -10,9 +10,22 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - `wispr-settings` is the GTK4/libadwaita settings window
 - `wisprctl` is the CLI for setup and daemon control
 - microphone selection is stored in `~/.config/wispr/config.toml`
-- the Deepgram API key is stored in GNOME Secret Service, not in the config file
+- the Deepgram API key and LLM API key are stored in GNOME Secret Service, not in the config file
 - direct typing uses `/dev/uinput`
 - live capture currently uses `pw-record` for the audio stream and GStreamer only for device enumeration
+- finalized transcript segments can be passed through an OpenAI-compatible `responses` backend for structured command interpretation
+- the LLM layer supports literal dictation, editing actions, and literal text plus actions in the same spoken segment
+
+## Capabilities
+
+- live dictation into the focused app
+- configurable microphone selection with persistent device choice
+- Deepgram speech-to-text streaming
+- OpenAI-compatible command interpretation with configurable base URL, model, and API key
+- spoken editing commands such as `hello enter`, `select all`, `copy`, `paste`, `undo`, and `redo`
+- repeated key actions such as `press space key twice`
+- function key actions such as `press the F5 key`
+- shell-style text cleanup for command dictation, for example `flutter dash dash version enter` becoming `flutter --version` followed by `Enter`
 
 ## Workspace Layout
 
@@ -33,6 +46,7 @@ Wispr expects these tools or services to exist at runtime:
 - `systemd --user`
 - `/dev/uinput`
 - a Deepgram API key
+- an OpenAI-compatible LLM API key if intelligence is enabled
 
 ## Build Dependencies
 
@@ -109,8 +123,29 @@ sudo ~/.local/bin/wisprctl setup-uinput
 Then:
 
 - store your Deepgram API key
+- optionally enable Intelligence and store your LLM API key
+- set the LLM base URL and model if you are not using the default OpenAI endpoint
 - select the microphone you want to use
 - save your settings
+
+## Intelligence Configuration
+
+Wispr can interpret finalized speech through a configurable OpenAI-compatible `responses` API backend. These fields live under `[intelligence]` in `~/.config/wispr/config.toml`:
+
+```toml
+[intelligence]
+enabled = true
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+timeout_ms = 2500
+max_recent_chars = 256
+command_mode = "always_infer"
+text_output_mode = "literal"
+action_scope = "editing_only"
+debug_overlay = true
+```
+
+The LLM API key is stored separately in GNOME Secret Service. The settings UI includes a `Test LLM` button, and the CLI exposes a direct interpreter test command.
 
 ## Day-To-Day Use
 
@@ -127,7 +162,20 @@ Other useful commands:
 ~/.local/bin/wisprctl stop
 ~/.local/bin/wisprctl status
 ~/.local/bin/wisprctl open-settings
+~/.local/bin/wisprctl test-llm "hello enter"
 ```
+
+## Intelligent Commands
+
+Examples of phrases that Wispr can now interpret:
+
+- `hello enter` -> types `hello` and presses `Enter`
+- `select all` -> sends `Ctrl+A`
+- `press space key twice` -> presses `Space` twice
+- `press the F5 key` -> presses `F5`
+- `flutter dash dash version enter` -> types `flutter --version` and presses `Enter`
+
+The LLM layer is constrained to editing-oriented actions only. It does not launch apps, run shell commands itself, click the mouse, or send arbitrary shortcuts.
 
 ## Hotkey Behavior
 
@@ -168,9 +216,12 @@ Check the daemon:
 
 ```bash
 ~/.local/bin/wisprctl status
+~/.local/bin/wisprctl test-llm "hello enter"
 systemctl --user status wisprd.service --no-pager
 journalctl --user -u wisprd.service -n 50 --no-pager
 ```
+
+The daemon status now includes LLM-related fields such as `intelligence_ready`, `llm_ready`, `last_llm_error`, `last_decision_kind`, and `intelligence_state`.
 
 ### No typing
 
@@ -206,8 +257,26 @@ If needed, verify the fallback command executes:
 ~/.local/bin/wisprctl toggle
 ```
 
+### LLM fallback or literal-only behavior
+
+If Wispr keeps typing literal text for commands, check:
+
+```bash
+~/.local/bin/wisprctl status
+~/.local/bin/wisprctl test-llm "select all"
+journalctl --user -u wisprd.service -n 50 --no-pager
+```
+
+Common causes:
+
+- no LLM API key stored in Secret Service
+- incorrect LLM base URL or model
+- backend compatibility issues with the OpenAI-compatible `responses` API
+- a backend that rejects strict JSON schema output
+
 ## Notes
 
 - the current Deepgram client uses the streaming listen endpoint and `nova-3`
 - the current capture path uses `pw-record` because it behaved more reliably on this machine than the earlier GStreamer live capture path
-- the daemon never presses `Enter` automatically
+- the LLM interpreter prefers streaming `responses` but falls back to a non-streaming `responses` request when a compatible backend closes the stream noisily
+- the daemon can press `Enter` or other supported keys only when the LLM interpreter explicitly returns those actions
