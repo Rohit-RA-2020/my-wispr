@@ -78,6 +78,12 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .build();
+    let generation_label = gtk::Label::builder()
+        .xalign(0.0)
+        .halign(Align::Start)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
     let context_label = gtk::Label::builder()
         .xalign(0.0)
         .halign(Align::Start)
@@ -89,6 +95,7 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
     container.append(&mic_label);
     container.append(&transcript_label);
     container.append(&intelligence_label);
+    container.append(&generation_label);
     container.append(&context_label);
     window.set_child(Some(&container));
 
@@ -116,6 +123,13 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
                 .intelligence_state
                 .as_ref()
                 .map(|state| format!("Intelligence: {state}"))
+                .unwrap_or_default(),
+        );
+        generation_label.set_label(
+            &status
+                .generation_state
+                .as_ref()
+                .map(|state| format!("Generation: {state}"))
                 .unwrap_or_default(),
         );
         context_label.set_label(

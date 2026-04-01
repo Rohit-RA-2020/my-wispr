@@ -119,12 +119,15 @@ async fn test_llm(text: &str, app_class: Option<&str>, app_id: Option<&str>) -> 
     );
 
     Ok(format!(
-        "decision={} rewrite_scope={:?} format_kind={:?} keep_block_open={} text_to_emit={:?} actions={:?} resolved={} raw={}",
+        "decision={} rewrite_scope={:?} format_kind={:?} keep_block_open={} text_to_emit={:?} generation_prompt={:?} generation_style={:?} replace_current_segment={} actions={:?} resolved={} raw={}",
         output.decision.kind.as_label(),
         output.decision.rewrite_scope,
         output.decision.format_kind,
         output.decision.keep_block_open,
         output.decision.text_to_emit,
+        output.decision.generation_prompt,
+        output.decision.generation_style,
+        output.decision.replace_current_segment,
         output.decision.actions,
         match resolved {
             Ok(actions) => format!("{:?} ({:?})", actions.actions, actions.description),

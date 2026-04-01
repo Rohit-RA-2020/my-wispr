@@ -17,7 +17,8 @@ pub use llm::{InterpreterOutput, LlmInterpreter};
 pub use models::{
     ActionCommand, ActionKey, ActionScope, ActionType, ActiveAppClass, ActiveAppContext,
     CommandMode, CorrectionScope, DaemonStatus, DecisionKind, DeviceChoice, DictationState,
-    FormatKind, FormattingTriggerPolicy, HotkeyBinding, ModifierKey, PreferredListStyle,
+    FormatKind, FormattingTriggerPolicy, GenerationInsertMode, GenerationRequest, GenerationStyle,
+    GenerationTargetScope, GenerationTriggerMode, HotkeyBinding, ModifierKey, PreferredListStyle,
     RewriteScope, SegmentDecision, SegmentDecisionRequest, SemanticCommandId,
     ShortcutDenylistProfile, TextOutputMode,
 };

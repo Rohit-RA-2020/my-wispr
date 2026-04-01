@@ -77,6 +77,7 @@ pub enum DecisionKind {
     Literal,
     Action,
     LiteralAndAction,
+    Generation,
 }
 
 impl DecisionKind {
@@ -85,7 +86,59 @@ impl DecisionKind {
             Self::Literal => "literal",
             Self::Action => "action",
             Self::LiteralAndAction => "literal_and_action",
+            Self::Generation => "generation",
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationStyle {
+    Generic,
+    PlainText,
+    Email,
+    Essay,
+}
+
+impl Default for GenerationStyle {
+    fn default() -> Self {
+        Self::Generic
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationTriggerMode {
+    ExplicitRequests,
+}
+
+impl Default for GenerationTriggerMode {
+    fn default() -> Self {
+        Self::ExplicitRequests
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationInsertMode {
+    ReplaceRequest,
+}
+
+impl Default for GenerationInsertMode {
+    fn default() -> Self {
+        Self::ReplaceRequest
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationTargetScope {
+    AnyTextField,
+}
+
+impl Default for GenerationTargetScope {
+    fn default() -> Self {
+        Self::AnyTextField
     }
 }
 
@@ -332,6 +385,12 @@ pub struct SegmentDecision {
     pub keep_block_open: bool,
     #[serde(default)]
     pub actions: Vec<ActionCommand>,
+    #[serde(default)]
+    pub generation_prompt: Option<String>,
+    #[serde(default)]
+    pub generation_style: Option<GenerationStyle>,
+    #[serde(default)]
+    pub replace_current_segment: bool,
 }
 
 impl SegmentDecision {
@@ -343,8 +402,23 @@ impl SegmentDecision {
             text_to_emit: text.into(),
             keep_block_open: false,
             actions: Vec::new(),
+            generation_prompt: None,
+            generation_style: None,
+            replace_current_segment: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationRequest {
+    pub request_text: String,
+    pub generation_prompt: String,
+    #[serde(default)]
+    pub generation_style: GenerationStyle,
+    #[serde(default)]
+    pub recent_text: String,
+    #[serde(default)]
+    pub active_app: Option<ActiveAppContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +460,10 @@ pub struct DaemonStatus {
     pub intelligence_state: Option<String>,
     pub active_app: Option<ActiveAppContext>,
     pub last_resolution: Option<String>,
+    pub generation_active: bool,
+    pub generation_ready: bool,
+    pub last_generation_error: Option<String>,
+    pub generation_state: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -406,6 +484,10 @@ impl Default for DaemonStatus {
             intelligence_state: None,
             active_app: None,
             last_resolution: None,
+            generation_active: false,
+            generation_ready: false,
+            last_generation_error: None,
+            generation_state: None,
             updated_at: Utc::now(),
         }
     }

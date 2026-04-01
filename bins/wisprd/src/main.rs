@@ -4,7 +4,15 @@ mod deepgram;
 mod overlay;
 mod portal;
 
-use std::{collections::HashSet, future::pending, process::Command, sync::Arc};
+use std::{
+    collections::HashSet,
+    future::pending,
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use audio::{AudioCapture, resolve_selected_device};
 use chrono::Utc;
@@ -13,8 +21,8 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
 use wispr_core::{
-    AppConfig, CorrectionScope, DecisionKind, FormattingTriggerPolicy, LlmInterpreter,
-    PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
+    AppConfig, CorrectionScope, DecisionKind, FormattingTriggerPolicy, GenerationRequest,
+    LlmInterpreter, PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
     models::{ActiveAppContext, DaemonStatus, DeviceChoice, DictationState, FormatKind},
     resolve_actions,
     secrets::SecretStore,
@@ -34,6 +42,7 @@ struct AppState {
 
 struct RunningSession {
     stop_tx: oneshot::Sender<()>,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +65,10 @@ struct StatusUpdate {
     intelligence_state: Option<Option<String>>,
     active_app: Option<Option<ActiveAppContext>>,
     last_resolution: Option<Option<String>>,
+    generation_active: Option<bool>,
+    generation_ready: Option<bool>,
+    last_generation_error: Option<Option<String>>,
+    generation_state: Option<Option<String>>,
 }
 
 struct DictationDbus {
@@ -194,6 +207,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
     let llm_state = load_llm_interpreter(&config, &secret_store).await?;
     let llm_ready = llm_state.is_some();
     let intelligence_ready = !config.intelligence.enabled || llm_ready;
+    let generation_ready =
+        !config.intelligence.enabled || !config.intelligence.generation_enabled || llm_ready;
     let llm_setup_error = if config.intelligence.enabled && !llm_ready {
         Some("Intelligence is enabled but the LLM backend is not configured. Falling back to literal dictation.".to_string())
     } else {
@@ -205,6 +220,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
     let mut deepgram = DeepgramSession::connect(&api_key).await?;
     let audio_tx = deepgram.audio_sender();
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
 
     publish_status(
         &state,
@@ -216,6 +232,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
             llm_ready: Some(llm_ready),
             last_error: Some(None),
             last_llm_error: Some(llm_setup_error.clone()),
+            last_generation_error: Some(None),
             last_decision_kind: Some(None),
             intelligence_state: Some(Some(if config.intelligence.enabled {
                 if llm_ready {
@@ -228,11 +245,23 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
             })),
             active_app: Some(None),
             last_resolution: Some(None),
+            generation_active: Some(false),
+            generation_ready: Some(generation_ready),
+            generation_state: Some(Some(if config.intelligence.generation_enabled {
+                if generation_ready {
+                    "Generation ready".to_string()
+                } else {
+                    "Generation unavailable".to_string()
+                }
+            } else {
+                "Generation disabled".to_string()
+            })),
         },
     )
     .await;
 
     let state_for_task = state.clone();
+    let cancel_for_task = cancel_flag.clone();
     tokio::spawn(async move {
         let mut committed_prefix = String::new();
         let mut active_block = None::<FormattingBlock>;
@@ -273,6 +302,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                         StatusUpdate {
                                             state: Some(DictationState::Error),
                                             last_error: Some(Some("Failed to forward audio to Deepgram".to_string())),
+                                            generation_active: Some(false),
                                             ..StatusUpdate::default()
                                         },
                                     )
@@ -287,6 +317,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 StatusUpdate {
                                     state: Some(DictationState::Error),
                                     last_error: Some(Some("Audio stream ended unexpectedly".to_string())),
+                                    generation_active: Some(false),
                                     ..StatusUpdate::default()
                                 },
                             )
@@ -307,6 +338,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 intelligence_state: Some(None),
                                 active_app: Some(None),
                                 last_resolution: Some(None),
+                                generation_active: Some(false),
                                 ..StatusUpdate::default()
                             },
                         )
@@ -346,6 +378,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 &mut committed_prefix,
                                 &mut active_block,
                                 &mut active_turn,
+                                &cancel_for_task,
                                 chunk,
                             )
                             .await;
@@ -372,6 +405,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                     &mut committed_prefix,
                                     &mut active_block,
                                     &mut active_turn,
+                                    &cancel_for_task,
                                     chunk,
                                 )
                                 .await;
@@ -393,6 +427,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 StatusUpdate {
                                     state: Some(DictationState::Error),
                                     last_error: Some(Some(message)),
+                                    generation_active: Some(false),
                                     ..StatusUpdate::default()
                                 },
                             )
@@ -416,6 +451,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                             intelligence_state: Some(None),
                             active_app: Some(None),
                             last_resolution: Some(None),
+                            generation_active: Some(false),
                             ..StatusUpdate::default()
                         },
                     )
@@ -427,7 +463,10 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
     });
 
     let mut guard = state.session.lock().await;
-    *guard = Some(RunningSession { stop_tx });
+    *guard = Some(RunningSession {
+        stop_tx,
+        cancel_flag,
+    });
     Ok("Started dictation".to_string())
 }
 
@@ -439,6 +478,7 @@ async fn process_finalized_segment(
     committed_prefix: &mut String,
     active_block: &mut Option<FormattingBlock>,
     active_turn: &mut String,
+    cancel_flag: &Arc<AtomicBool>,
     chunk: TranscriptChunk,
 ) {
     let previous_rendered = render_transcript(committed_prefix, active_block.as_ref(), active_turn);
@@ -488,6 +528,25 @@ async fn process_finalized_segment(
 
         match interpreter.decide(&request).await {
             Ok(output) => {
+                if output.decision.kind == DecisionKind::Generation {
+                    process_generation_segment(
+                        state,
+                        config,
+                        keyboard,
+                        interpreter,
+                        committed_prefix,
+                        active_block,
+                        active_turn,
+                        cancel_flag,
+                        previous_rendered,
+                        &request,
+                        output.decision,
+                        chunk,
+                    )
+                    .await;
+                    return;
+                }
+
                 let resolved_actions = match resolve_actions(
                     &config.intelligence,
                     &output.decision.actions,
@@ -632,6 +691,177 @@ async fn process_finalized_segment(
     active_turn.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn process_generation_segment(
+    state: &Arc<AppState>,
+    config: &AppConfig,
+    keyboard: &mut UInputKeyboard,
+    interpreter: &LlmInterpreter,
+    committed_prefix: &mut String,
+    active_block: &mut Option<FormattingBlock>,
+    active_turn: &mut String,
+    cancel_flag: &Arc<AtomicBool>,
+    previous_rendered: String,
+    request: &SegmentDecisionRequest,
+    decision: wispr_core::SegmentDecision,
+    chunk: TranscriptChunk,
+) {
+    if !config.intelligence.generation_enabled {
+        let next_rendered =
+            render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
+        apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+        *committed_prefix = next_rendered;
+        *active_block = None;
+        active_turn.clear();
+        return;
+    }
+
+    let generation_prompt = match decision.generation_prompt.clone() {
+        Some(prompt) if !prompt.trim().is_empty() => prompt,
+        _ => {
+            warn!("generation decision is missing generation_prompt");
+            let next_rendered =
+                render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
+            apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
+            *committed_prefix = next_rendered;
+            *active_block = None;
+            active_turn.clear();
+            return;
+        }
+    };
+
+    let generation_request = GenerationRequest {
+        request_text: chunk.text.clone(),
+        generation_prompt,
+        generation_style: decision.generation_style.unwrap_or_default(),
+        recent_text: request.recent_text.clone(),
+        active_app: request.active_app.clone(),
+    };
+
+    let generation_prefix = render_transcript(committed_prefix, active_block.as_ref(), "");
+    let mut current_rendered = generation_prefix.clone();
+    apply_transcript(state, keyboard, &previous_rendered, &current_rendered).await;
+
+    publish_status(
+        state,
+        StatusUpdate {
+            last_decision_kind: Some(Some(DecisionKind::Generation)),
+            last_llm_error: Some(None),
+            last_generation_error: Some(None),
+            intelligence_state: Some(Some("Generating reply".to_string())),
+            generation_active: Some(true),
+            generation_state: Some(Some("Generating reply".to_string())),
+            active_app: Some(request.active_app.clone()),
+            last_resolution: Some(Some("Autonomous writing".to_string())),
+            ..StatusUpdate::default()
+        },
+    )
+    .await;
+
+    let mut generated_text = String::new();
+    let mut generation_stream =
+        interpreter.start_generation_stream(generation_request, cancel_flag.clone());
+
+    while let Some(next) = generation_stream.recv().await {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        match next {
+            Ok(delta) => {
+                if delta.is_empty() {
+                    continue;
+                }
+                generated_text.push_str(&delta);
+                let next_rendered = render_generated_output(&generation_prefix, &generated_text);
+                apply_transcript(state, keyboard, &current_rendered, &next_rendered).await;
+                current_rendered = next_rendered;
+            }
+            Err(error) => {
+                warn!("generation failed: {error}");
+                if generated_text.is_empty() {
+                    let next_rendered = render_literal_fallback(
+                        committed_prefix,
+                        active_block.as_ref(),
+                        &chunk.text,
+                    );
+                    apply_transcript(state, keyboard, &current_rendered, &next_rendered).await;
+                    *committed_prefix = next_rendered;
+                    *active_block = None;
+                    active_turn.clear();
+                    publish_status(
+                        state,
+                        StatusUpdate {
+                            generation_active: Some(false),
+                            generation_state: Some(Some("Literal fallback".to_string())),
+                            last_generation_error: Some(Some(error.to_string())),
+                            intelligence_state: Some(Some("Literal fallback".to_string())),
+                            ..StatusUpdate::default()
+                        },
+                    )
+                    .await;
+                    return;
+                }
+
+                *committed_prefix = current_rendered;
+                *active_block = None;
+                active_turn.clear();
+                publish_status(
+                    state,
+                    StatusUpdate {
+                        generation_active: Some(false),
+                        generation_state: Some(Some("Generation failed".to_string())),
+                        last_generation_error: Some(Some(error.to_string())),
+                        intelligence_state: Some(Some("Generation failed".to_string())),
+                        ..StatusUpdate::default()
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        if generated_text.is_empty() {
+            let next_rendered =
+                render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
+            apply_transcript(state, keyboard, &current_rendered, &next_rendered).await;
+            *committed_prefix = next_rendered;
+        } else {
+            *committed_prefix = current_rendered;
+        }
+        *active_block = None;
+        active_turn.clear();
+        publish_status(
+            state,
+            StatusUpdate {
+                generation_active: Some(false),
+                generation_state: Some(Some("Generation stopped".to_string())),
+                intelligence_state: Some(Some("Generation stopped".to_string())),
+                ..StatusUpdate::default()
+            },
+        )
+        .await;
+        return;
+    }
+
+    *committed_prefix = current_rendered;
+    *active_block = None;
+    active_turn.clear();
+    publish_status(
+        state,
+        StatusUpdate {
+            generation_active: Some(false),
+            generation_state: Some(Some("Generation complete".to_string())),
+            last_generation_error: Some(None),
+            intelligence_state: Some(Some("Generation complete".to_string())),
+            ..StatusUpdate::default()
+        },
+    )
+    .await;
+}
+
 async fn load_llm_interpreter(
     config: &AppConfig,
     secret_store: &SecretStore,
@@ -687,6 +917,7 @@ async fn stop_dictation(state: Arc<AppState>) -> Result<String> {
         return Ok("Dictation is not active".to_string());
     };
 
+    session.cancel_flag.store(true, Ordering::Relaxed);
     let _ = session.stop_tx.send(());
     publish_status(
         &state,
@@ -696,6 +927,8 @@ async fn stop_dictation(state: Arc<AppState>) -> Result<String> {
             intelligence_state: Some(None),
             active_app: Some(None),
             last_resolution: Some(None),
+            generation_active: Some(false),
+            generation_state: Some(Some("Generation stopped".to_string())),
             ..StatusUpdate::default()
         },
     )
@@ -719,6 +952,8 @@ async fn build_status(
             .unwrap_or(false),
         _ => false,
     };
+    let generation_ready =
+        !config.intelligence.enabled || !config.intelligence.generation_enabled || llm_ready;
 
     DaemonStatus {
         state: state_override.unwrap_or(DictationState::Idle),
@@ -746,6 +981,18 @@ async fn build_status(
         },
         active_app: None,
         last_resolution: None,
+        generation_active: false,
+        generation_ready,
+        last_generation_error: None,
+        generation_state: Some(if config.intelligence.generation_enabled {
+            if generation_ready {
+                "Generation ready".to_string()
+            } else {
+                "Generation unavailable".to_string()
+            }
+        } else {
+            "Generation disabled".to_string()
+        }),
         updated_at: Utc::now(),
     }
 }
@@ -763,6 +1010,9 @@ async fn sync_status(
     status.intelligence_state = existing.intelligence_state.or(status.intelligence_state);
     status.active_app = existing.active_app;
     status.last_resolution = existing.last_resolution;
+    status.generation_active = existing.generation_active;
+    status.last_generation_error = existing.last_generation_error;
+    status.generation_state = existing.generation_state.or(status.generation_state);
     state.overlay.push(status.clone());
     *state.status.write().await = status;
     Ok(())
@@ -803,6 +1053,18 @@ async fn publish_status(state: &Arc<AppState>, update: StatusUpdate) {
     }
     if let Some(last_resolution) = update.last_resolution {
         status.last_resolution = last_resolution;
+    }
+    if let Some(generation_active) = update.generation_active {
+        status.generation_active = generation_active;
+    }
+    if let Some(generation_ready) = update.generation_ready {
+        status.generation_ready = generation_ready;
+    }
+    if let Some(last_generation_error) = update.last_generation_error {
+        status.last_generation_error = last_generation_error;
+    }
+    if let Some(generation_state) = update.generation_state {
+        status.generation_state = generation_state;
     }
 
     status.updated_at = Utc::now();
@@ -869,6 +1131,23 @@ fn render_literal_fallback(
         literal_text,
         &FormatKind::Plain,
     )
+}
+
+fn render_generated_output(committed_prefix: &str, generated_text: &str) -> String {
+    if committed_prefix.is_empty() {
+        return generated_text.to_string();
+    }
+    if generated_text.is_empty() {
+        return committed_prefix.to_string();
+    }
+    if generated_text.starts_with('\n') {
+        return format!("{committed_prefix}{generated_text}");
+    }
+    if needs_separator(committed_prefix, generated_text) {
+        format!("{committed_prefix} {generated_text}")
+    } else {
+        format!("{committed_prefix}{generated_text}")
+    }
 }
 
 fn next_block_raw(active_block: Option<&FormattingBlock>, finalized_text: &str) -> String {

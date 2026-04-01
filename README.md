@@ -1,6 +1,6 @@
 # Wispr
 
-Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, or formatted text instead of literal text.
+Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, formatted text, or autonomous generated writing instead of literal text.
 
 This repository currently targets Ubuntu GNOME on Wayland.
 
@@ -14,7 +14,7 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - direct typing uses `/dev/uinput`
 - live capture currently uses `pw-record` for the audio stream and GStreamer only for device enumeration
 - finalized transcript segments can be passed through an OpenAI-compatible `responses` backend for structured command interpretation
-- the LLM layer supports literal dictation, editing actions, semantic commands, block formatting, and literal text plus actions in the same spoken segment
+- the LLM layer supports literal dictation, editing actions, semantic commands, block formatting, autonomous writing mode, and literal text plus actions in the same spoken segment
 
 ## Capabilities
 
@@ -30,6 +30,8 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - function key actions such as `press the F5 key`
 - shell-style text cleanup for command dictation, for example `flutter dash dash version enter` becoming `flutter --version` followed by `Enter`
 - intelligent list formatting and block rewrites for structured dictation such as to-do lists with spoken corrections
+- autonomous writing mode for explicit prompts such as `write an essay on world war two` or `draft an email for leave`
+- streamed long-form generation directly into the focused text field, with stop keeping partial output
 
 ## Workspace Layout
 
@@ -142,6 +144,7 @@ enabled = true
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 timeout_ms = 2500
+generation_timeout_ms = 120000
 max_recent_chars = 256
 command_mode = "always_infer"
 text_output_mode = "literal"
@@ -149,12 +152,18 @@ action_scope = "editing_only"
 debug_overlay = true
 dynamic_shortcuts_enabled = true
 semantic_commands_enabled = true
+generation_enabled = true
+generation_trigger_mode = "explicit_requests"
+generation_insert_mode = "replace_request"
+generation_target_scope = "any_text_field"
 shortcut_denylist_profile = "minimal"
 shortcut_allowlist = []
 shortcut_denylist = []
 ```
 
-The LLM API key is stored separately in GNOME Secret Service. The settings UI includes a `Test LLM` button plus controls for dynamic shortcuts, semantic commands, denylist profile, and optional allowlist or denylist overrides. The CLI also exposes direct interpreter test commands.
+`timeout_ms` is the short command-interpretation budget. `generation_timeout_ms` is a much longer safety ceiling for autonomous writing streams, so essays and emails can finish naturally instead of being cut off after a couple seconds.
+
+The LLM API key is stored separately in GNOME Secret Service. The settings UI includes a `Test LLM` button plus controls for dynamic shortcuts, semantic commands, autonomous writing, denylist profile, timeouts, and optional allowlist or denylist overrides. The CLI also exposes direct interpreter test commands.
 
 ## Day-To-Day Use
 
@@ -174,6 +183,7 @@ Other useful commands:
 ~/.local/bin/wisprctl test-llm "hello enter"
 ~/.local/bin/wisprctl test-llm "press control t"
 ~/.local/bin/wisprctl test-llm --app-class browser "open a new browser tab"
+~/.local/bin/wisprctl test-llm "write an essay on world war two"
 ```
 
 ## Intelligent Commands
@@ -194,6 +204,24 @@ Examples of phrases that Wispr can now interpret:
 - `reopen the last closed tab` -> resolves to `Ctrl+Shift+T`
 - `focus the address bar` -> resolves to `Ctrl+L`
 - `save file` -> resolves to `Ctrl+S`
+
+## Autonomous Writing
+
+Wispr can detect explicit writing requests and switch into autonomous writing mode.
+
+Examples:
+
+- `write an essay on world war two`
+- `draft an email for leave`
+- `compose a short reply saying I will join after lunch`
+
+Behavior:
+
+- the spoken request is removed from the text field once generation starts
+- generated text is streamed directly into the focused field as it arrives
+- generation stops when the model finishes, when you stop Wispr manually, or when the backend ends the stream
+- if you stop mid-generation, partial generated output stays in the field
+- autonomous writing uses a separate long `generation_timeout_ms` safety ceiling instead of the short command timeout
 
 ## Intelligent Formatting
 
@@ -253,7 +281,7 @@ systemctl --user status wisprd.service --no-pager
 journalctl --user -u wisprd.service -n 50 --no-pager
 ```
 
-The daemon status now includes LLM-related fields such as `intelligence_ready`, `llm_ready`, `last_llm_error`, `last_decision_kind`, `intelligence_state`, and may also show the detected active app plus the last resolved shortcut description.
+The daemon status now includes LLM-related fields such as `intelligence_ready`, `llm_ready`, `last_llm_error`, `last_decision_kind`, `intelligence_state`, `generation_ready`, `generation_active`, `last_generation_error`, and may also show the detected active app plus the last resolved shortcut description.
 
 ### No typing
 
@@ -298,6 +326,7 @@ If Wispr keeps typing literal text for commands, check:
 ~/.local/bin/wisprctl test-llm "select all"
 ~/.local/bin/wisprctl test-llm "press control t"
 ~/.local/bin/wisprctl test-llm --app-class browser "open a new browser tab"
+~/.local/bin/wisprctl test-llm "draft an email for leave"
 journalctl --user -u wisprd.service -n 50 --no-pager
 ```
 
@@ -309,6 +338,7 @@ Common causes:
 - a backend that rejects strict JSON schema output
 - a shortcut blocked by the built-in safety policy or your configured denylist
 - missing or wrong app context for a semantic command that depends on browser-style mappings
+- generation timeout set too low for the amount of text you asked it to write
 
 ## Notes
 
@@ -317,4 +347,6 @@ Common causes:
 - the LLM interpreter prefers streaming `responses` but falls back to a non-streaming `responses` request when a compatible backend closes the stream noisily
 - the daemon can press dynamic modifier combinations with `Ctrl`, `Shift`, `Alt`, and `Super`
 - semantic commands currently cover common high-value app actions such as tab control, reload, find, save, copy, paste, undo, redo, and address-bar focus
+- autonomous writing currently triggers only for explicit writing requests, not broad generative inference
+- autonomous writing reuses the same configured LLM backend, model, and API key as the command interpreter, but uses a separate long generation timeout
 - a minimal built-in safety policy blocks clearly dangerous shortcuts such as `Ctrl+Alt+Delete` and `Super+L`

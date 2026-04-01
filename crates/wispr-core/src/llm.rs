@@ -1,8 +1,15 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::{
@@ -10,8 +17,8 @@ use crate::{
     error::{Result, WisprError},
     models::{
         ActionCommand, ActionScope, ActionType, CommandMode, CorrectionScope, DecisionKind,
-        FormattingTriggerPolicy, ModifierKey, PreferredListStyle, SegmentDecision,
-        SegmentDecisionRequest, TextOutputMode,
+        FormattingTriggerPolicy, GenerationRequest, GenerationStyle, ModifierKey,
+        PreferredListStyle, SegmentDecision, SegmentDecisionRequest, TextOutputMode,
     },
 };
 
@@ -28,8 +35,7 @@ pub struct InterpreterOutput {
 
 impl LlmInterpreter {
     pub fn new(config: IntelligenceConfig, api_key: impl Into<String>) -> Result<Self> {
-        let timeout = Duration::from_millis(config.timeout_ms.max(250));
-        let client = Client::builder().timeout(timeout).build()?;
+        let client = build_http_client(config.timeout_ms.max(250))?;
         Ok(Self {
             client,
             config,
@@ -239,12 +245,77 @@ impl LlmInterpreter {
     }
 
     fn authorized_post(&self, endpoint: String) -> RequestBuilder {
-        let request = self.client.post(endpoint);
-        if is_azure_compatible_base_url(&self.config.base_url) {
-            request.header("api-key", &self.api_key)
-        } else {
-            request.bearer_auth(&self.api_key)
-        }
+        authorized_post_for(&self.client, &self.config.base_url, &self.api_key, endpoint)
+    }
+
+    pub fn start_generation_stream(
+        &self,
+        request: GenerationRequest,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> mpsc::Receiver<Result<String>> {
+        let config = self.config.clone();
+        let api_key = self.api_key.clone();
+        let (tx, rx) = mpsc::channel::<Result<String>>(32);
+
+        tokio::spawn(async move {
+            let client = match build_http_client(config.generation_timeout_ms.max(1_000)) {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
+            let endpoint = format!("{}/responses", config.base_url.trim_end_matches('/'));
+            let response = match authorized_post_for(&client, &config.base_url, &api_key, endpoint)
+                .json(&build_generation_request_body(&config, &request, true))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = tx.send(Err(WisprError::Http(error.to_string()))).await;
+                    return;
+                }
+            };
+
+            if let Err(error) = stream_generation_response(
+                &client,
+                config.clone(),
+                &api_key,
+                request,
+                response,
+                tx.clone(),
+                cancel_flag.clone(),
+            )
+            .await
+            {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = tx.send(Err(error)).await;
+            }
+        });
+
+        rx
+    }
+}
+
+fn build_http_client(timeout_ms: u64) -> Result<Client> {
+    let timeout = Duration::from_millis(timeout_ms.max(250));
+    Ok(Client::builder().timeout(timeout).build()?)
+}
+
+fn authorized_post_for(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    endpoint: String,
+) -> RequestBuilder {
+    let request = client.post(endpoint);
+    if is_azure_compatible_base_url(base_url) {
+        request.header("api-key", api_key)
+    } else {
+        request.bearer_auth(api_key)
     }
 }
 
@@ -287,19 +358,67 @@ fn build_request_body(
     })
 }
 
+fn build_generation_request_body(
+    config: &IntelligenceConfig,
+    request: &GenerationRequest,
+    stream: bool,
+) -> Value {
+    json!({
+        "model": config.model,
+        "stream": stream,
+        "input": [
+            {
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": generation_prompt(request.generation_style.clone())
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": serde_json::to_string_pretty(request).unwrap_or_else(|_| "{}".to_string())
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+fn generation_prompt(style: GenerationStyle) -> &'static str {
+    match style {
+        GenerationStyle::Generic => {
+            "You are Wispr's autonomous writing mode. Produce ready-to-paste end-user text only. Do not return JSON, markdown fences, labels, or commentary about what you are doing. Use the user's request, recent typed context, and active app context only as writing context."
+        }
+        GenerationStyle::PlainText => {
+            "You are Wispr's autonomous writing mode. Produce ready-to-paste plain text only. Do not return JSON, markdown fences, labels, or commentary about what you are doing. Use the user's request, recent typed context, and active app context only as writing context."
+        }
+        GenerationStyle::Email => {
+            "You are Wispr's autonomous writing mode. Produce a ready-to-paste email body in plain text unless the request explicitly asks for a subject line. Do not return JSON, markdown fences, or commentary."
+        }
+        GenerationStyle::Essay => {
+            "You are Wispr's autonomous writing mode. Produce a ready-to-paste essay or paragraph response in plain text. Do not return JSON, markdown fences, or commentary."
+        }
+    }
+}
+
 fn developer_prompt() -> &'static str {
-    "You are Wispr, a safe dictation command interpreter and formatter. You receive one finalized spoken segment, recent typed context, an optional active formatting block, and optional active app context. Return strict JSON only. Keep ordinary prose literal unless structure is explicit or very strong. Prefer numbered lists for sequential speech. Use bullet lists only when the speech is clearly unordered. Spoken corrections such as 'wait', 'no', 'not X, Y instead', or 'replace the third one' should usually rewrite the current block, not append a new literal sentence. rewrite_scope='segment' means only the current finalized segment should be committed. rewrite_scope='current_block' means text_to_emit is the full replacement for the active formatting block. keep_block_open should stay true while the user is still building or correcting the same list or note block. You may emit explicit keyboard actions with modifiers Ctrl, Shift, Alt, and Super. You may also emit semantic_command actions for common app intents such as new_tab, close_tab, reopen_closed_tab, refresh, find, save, copy, paste, cut, undo, redo, focus_address_bar, next_tab, and previous_tab. Prefer semantic_command for high-level phrases like 'open a new browser tab' or 'focus the address bar'. If active app context is available, use it. Allowed keys include letters A-Z, digits Digit0-Digit9, Space, Enter, Tab, Escape, Backspace, Delete, Insert, Left, Right, Up, Down, Home, End, PageUp, PageDown, and F1-F12. Each action may set repeat to run the same key multiple times, such as Space repeated twice. Never invent dangerous system actions. Never launch apps, run shell commands, click, or move the mouse. If unsure, keep the speech literal. If the spoken text is ordinary prose, return kind literal, format_kind plain, rewrite_scope segment, and keep text_to_emit equal to the literal transcript. If command words should not remain in the editor, remove them from text_to_emit. Normalize command-like text when the user is dictating shell commands or flags: for example 'flutter dash dash version enter' should become text_to_emit 'flutter --version' plus Enter. Example formatting behavior: a spoken to-do list should become a numbered list; a later correction like 'wait, not housecleaning, washing of clothes' should rewrite the current list block so the corrected item replaces the old one."
+    "You are Wispr, a safe dictation command interpreter, formatter, and writing-mode detector. You receive one finalized spoken segment, recent typed context, an optional active formatting block, and optional active app context. Return strict JSON only. Keep ordinary prose literal unless structure is explicit or very strong. Prefer numbered lists for sequential speech. Use bullet lists only when the speech is clearly unordered. Spoken corrections such as 'wait', 'no', 'not X, Y instead', or 'replace the third one' should usually rewrite the current block, not append a new literal sentence. rewrite_scope='segment' means only the current finalized segment should be committed. rewrite_scope='current_block' means text_to_emit is the full replacement for the active formatting block. keep_block_open should stay true while the user is still building or correcting the same list or note block. You may emit explicit keyboard actions with modifiers Ctrl, Shift, Alt, and Super. You may also emit semantic_command actions for common app intents such as new_tab, close_tab, reopen_closed_tab, refresh, find, save, copy, paste, cut, undo, redo, focus_address_bar, next_tab, and previous_tab. Prefer semantic_command for high-level phrases like 'open a new browser tab' or 'focus the address bar'. You may return kind='generation' only for explicit autonomous-writing requests such as 'write an essay on...', 'draft an email for leave', 'compose a reply saying...', or 'generate a paragraph about...'. Do not use generation for ordinary dictation, formatting, editing commands, shell commands, or ambiguous wording. When kind='generation', set generation_prompt to the normalized user request, set generation_style to generic/plain_text/email/essay, set replace_current_segment=true, set text_to_emit to an empty string, and return no actions. If active app context is available, use it. Allowed keys include letters A-Z, digits Digit0-Digit9, Space, Enter, Tab, Escape, Backspace, Delete, Insert, Left, Right, Up, Down, Home, End, PageUp, PageDown, and F1-F12. Each action may set repeat to run the same key multiple times, such as Space repeated twice. Never invent dangerous system actions. Never launch apps, run shell commands, click, or move the mouse. If unsure, keep the speech literal. If the spoken text is ordinary prose, return kind literal, format_kind plain, rewrite_scope segment, and keep text_to_emit equal to the literal transcript. If command words should not remain in the editor, remove them from text_to_emit. Normalize command-like text when the user is dictating shell commands or flags: for example 'flutter dash dash version enter' should become text_to_emit 'flutter --version' plus Enter. Example formatting behavior: a spoken to-do list should become a numbered list; a later correction like 'wait, not housecleaning, washing of clothes' should rewrite the current list block so the corrected item replaces the old one."
 }
 
 fn decision_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["kind", "rewrite_scope", "format_kind", "text_to_emit", "keep_block_open", "actions"],
+        "required": ["kind", "rewrite_scope", "format_kind", "text_to_emit", "keep_block_open", "actions", "generation_prompt", "generation_style", "replace_current_segment"],
         "properties": {
             "kind": {
                 "type": "string",
-                "enum": ["literal", "action", "literal_and_action"]
+                "enum": ["literal", "action", "literal_and_action", "generation"]
             },
             "rewrite_scope": {
                 "type": "string",
@@ -373,9 +492,187 @@ fn decision_schema() -> Value {
                         }
                     }
                 }
+            },
+            "generation_prompt": {
+                "anyOf": [
+                    {
+                        "type": "string"
+                    },
+                    {
+                        "type": "null"
+                    }
+                ]
+            },
+            "generation_style": {
+                "anyOf": [
+                    {
+                        "type": "string",
+                        "enum": ["generic", "plain_text", "email", "essay"]
+                    },
+                    {
+                        "type": "null"
+                    }
+                ]
+            },
+            "replace_current_segment": {
+                "type": "boolean"
             }
         }
     })
+}
+
+async fn stream_generation_response(
+    client: &Client,
+    config: IntelligenceConfig,
+    api_key: &str,
+    request: GenerationRequest,
+    response: reqwest::Response,
+    tx: mpsc::Sender<Result<String>>,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<()> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    if !content_type.contains("text/event-stream") {
+        return send_generation_non_streaming(client, &config, api_key, request, tx).await;
+    }
+
+    let mut raw_stream = String::new();
+    let mut fallback_text = String::new();
+    let mut completion_payload = None::<Value>;
+    let mut buffer = String::new();
+    let mut emitted_any = false;
+    let mut stream = response.bytes_stream();
+
+    while let Some(next) = stream.next().await {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        match next {
+            Ok(chunk) => {
+                let chunk_text = String::from_utf8_lossy(&chunk);
+                raw_stream.push_str(&chunk_text);
+                buffer.push_str(&chunk_text);
+
+                while let Some(frame) = pop_sse_frame(&mut buffer) {
+                    if let Some(delta) = process_generation_sse_frame(
+                        &frame,
+                        &mut fallback_text,
+                        &mut completion_payload,
+                        &raw_stream,
+                    )? {
+                        emitted_any = true;
+                        if tx.send(Ok(delta)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                if emitted_any || !fallback_text.trim().is_empty() || completion_payload.is_some() {
+                    break;
+                }
+                let err = WisprError::Http(format!("error decoding response body: {error}"));
+                if should_retry_non_streaming(&err) {
+                    return send_generation_non_streaming(client, &config, api_key, request, tx)
+                        .await;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    while let Some(frame) = pop_sse_frame(&mut buffer) {
+        if let Some(delta) = process_generation_sse_frame(
+            &frame,
+            &mut fallback_text,
+            &mut completion_payload,
+            &raw_stream,
+        )? {
+            emitted_any = true;
+            if tx.send(Ok(delta)).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    if !status.is_success() && !emitted_any && fallback_text.trim().is_empty() {
+        return Err(WisprError::Http(format!(
+            "HTTP {} from LLM backend with empty generation stream",
+            status
+        )));
+    }
+
+    if !emitted_any {
+        if let Some(event) = completion_payload {
+            if let Some(text) = extract_completed_output_text(&event) {
+                if !text.is_empty() {
+                    let _ = tx.send(Ok(text)).await;
+                    return Ok(());
+                }
+            }
+        }
+        if !fallback_text.is_empty() {
+            let _ = tx.send(Ok(fallback_text)).await;
+            return Ok(());
+        }
+        return send_generation_non_streaming(client, &config, api_key, request, tx).await;
+    }
+
+    Ok(())
+}
+
+async fn send_generation_non_streaming(
+    client: &Client,
+    config: &IntelligenceConfig,
+    api_key: &str,
+    request: GenerationRequest,
+    tx: mpsc::Sender<Result<String>>,
+) -> Result<()> {
+    let endpoint = format!("{}/responses", config.base_url.trim_end_matches('/'));
+    let response = authorized_post_for(client, &config.base_url, api_key, endpoint)
+        .json(&build_generation_request_body(config, &request, false))
+        .send()
+        .await?;
+    let status = response.status();
+    let body_text = response
+        .text()
+        .await
+        .map_err(|error| WisprError::Http(format!("error decoding response body: {error}")))?;
+
+    if !status.is_success() {
+        return Err(WisprError::Http(format!(
+            "HTTP {} from LLM backend: {}",
+            status,
+            truncate_for_error(&body_text)
+        )));
+    }
+
+    let value: Value = serde_json::from_str(&body_text).map_err(|error| {
+        WisprError::Http(format!(
+            "failed to parse non-streaming generation response body: {error}; body={}",
+            truncate_for_error(&body_text)
+        ))
+    })?;
+    let generated = extract_response_output_text(&value).ok_or_else(|| {
+        WisprError::InvalidState(
+            "LLM backend returned a generation response without output text".to_string(),
+        )
+    })?;
+    if tx.send(Ok(generated)).await.is_err() {
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn pop_sse_frame(buffer: &mut String) -> Option<String> {
@@ -469,6 +766,65 @@ fn process_sse_frame(
     Ok(false)
 }
 
+fn process_generation_sse_frame(
+    frame: &str,
+    fallback_text: &mut String,
+    completion_payload: &mut Option<Value>,
+    raw_stream: &str,
+) -> Result<Option<String>> {
+    let Some(data) = extract_sse_data(frame) else {
+        return Ok(None);
+    };
+    if data.trim() == "[DONE]" {
+        return Ok(None);
+    }
+
+    let event: Value = serde_json::from_str(&data).map_err(|error| {
+        WisprError::Http(format!(
+            "failed to parse streamed generation event: {error}; body={}",
+            truncate_for_error(raw_stream)
+        ))
+    })?;
+
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                fallback_text.push_str(delta);
+                return Ok(Some(delta.to_string()));
+            }
+        }
+        Some("response.output_text.done") => {
+            if fallback_text.is_empty() {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    fallback_text.push_str(text);
+                    return Ok(Some(text.to_string()));
+                }
+            }
+        }
+        Some("response.completed") => {
+            *completion_payload = Some(event);
+        }
+        Some("error") | Some("response.failed") => {
+            return Err(WisprError::Http(
+                event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event
+                            .get("error")
+                            .and_then(|value| value.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("LLM generation request failed")
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(None)
+}
+
 fn extract_completed_output_text(event: &Value) -> Option<String> {
     event
         .get("response")
@@ -524,6 +880,7 @@ fn should_retry_non_streaming(error: &WisprError) -> bool {
             message.contains("error decoding response body")
                 || message.contains("returned no structured output")
                 || message.contains("failed to parse streamed response event")
+                || message.contains("failed to parse streamed generation event")
         }
         WisprError::InvalidState(message) => message.contains("returned no structured output"),
         WisprError::Json(_) => true,
@@ -542,27 +899,156 @@ fn validate_decision(
         return Ok(SegmentDecision::literal(request.literal_text.clone()));
     }
 
+    if decision.kind == DecisionKind::Generation {
+        return validate_generation_decision(request, decision);
+    }
+
     hydrate_missing_actions(request, &mut decision);
     let normalized_text = normalize_command_text(&decision.text_to_emit);
 
     for action in &decision.actions {
         validate_action(action, &request.action_scope)?;
     }
+    decision.actions = dedupe_actions(decision.actions);
 
-    if decision.kind == DecisionKind::Action && !decision.text_to_emit.is_empty() {
+    if decision.kind == DecisionKind::Literal && decision.actions.is_empty() {
+        if let Some((text_to_emit, key)) = infer_literal_and_key_action(&request.finalized_text) {
+            let normalized_text = normalize_command_text(&text_to_emit);
+            return Ok(SegmentDecision {
+                kind: if normalized_text.is_empty() {
+                    DecisionKind::Action
+                } else {
+                    DecisionKind::LiteralAndAction
+                },
+                rewrite_scope: crate::models::RewriteScope::Segment,
+                format_kind: crate::models::FormatKind::Plain,
+                text_to_emit: normalized_text,
+                keep_block_open: false,
+                actions: vec![ActionCommand {
+                    action_type: ActionType::Key,
+                    key: Some(key),
+                    modifiers: Vec::new(),
+                    repeat: 1,
+                    command_id: None,
+                    target_app: request.active_app.as_ref().map(|app| app.app_class.clone()),
+                }],
+                generation_prompt: None,
+                generation_style: None,
+                replace_current_segment: false,
+            });
+        }
+    }
+
+    if !decision.actions.is_empty() {
+        let mut action_text = normalized_text;
+        if let Some((stripped_text, inferred_key)) =
+            infer_literal_and_key_action(&request.finalized_text)
+        {
+            if decision.actions.iter().any(|action| {
+                action.action_type == ActionType::Key
+                    && action.key == Some(inferred_key.clone())
+                    && action.modifiers.is_empty()
+            }) {
+                action_text = normalize_command_text(&stripped_text);
+            }
+        }
         return Ok(SegmentDecision {
-            kind: DecisionKind::LiteralAndAction,
+            kind: if action_text.is_empty() {
+                DecisionKind::Action
+            } else {
+                DecisionKind::LiteralAndAction
+            },
             rewrite_scope: decision.rewrite_scope,
             format_kind: decision.format_kind,
-            text_to_emit: normalized_text,
+            text_to_emit: action_text,
             keep_block_open: decision.keep_block_open,
             actions: decision.actions,
+            generation_prompt: None,
+            generation_style: None,
+            replace_current_segment: false,
         });
     }
 
     Ok(SegmentDecision {
+        generation_prompt: None,
+        generation_style: None,
+        replace_current_segment: false,
         text_to_emit: normalized_text,
         ..decision
+    })
+}
+
+fn dedupe_actions(actions: Vec<ActionCommand>) -> Vec<ActionCommand> {
+    let mut deduped = Vec::new();
+    for action in actions {
+        if !deduped
+            .iter()
+            .any(|existing| actions_match(existing, &action))
+        {
+            deduped.push(action);
+        }
+    }
+    deduped
+}
+
+fn actions_match(left: &ActionCommand, right: &ActionCommand) -> bool {
+    left.action_type == right.action_type
+        && left.key == right.key
+        && left.modifiers == right.modifiers
+        && left.repeat == right.repeat
+        && left.command_id == right.command_id
+}
+
+fn validate_generation_decision(
+    _request: &SegmentDecisionRequest,
+    decision: SegmentDecision,
+) -> Result<SegmentDecision> {
+    let generation_prompt = decision
+        .generation_prompt
+        .as_ref()
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    if generation_prompt.is_empty() {
+        return Err(WisprError::InvalidState(
+            "generation decision is missing generation_prompt".to_string(),
+        ));
+    }
+    if !decision.replace_current_segment {
+        return Err(WisprError::InvalidState(
+            "generation decision must replace the current segment".to_string(),
+        ));
+    }
+    if !decision.actions.is_empty() {
+        return Err(WisprError::InvalidState(
+            "generation decision cannot include actions".to_string(),
+        ));
+    }
+    if decision.rewrite_scope != crate::models::RewriteScope::Segment {
+        return Err(WisprError::InvalidState(
+            "generation decision must use rewrite_scope=segment".to_string(),
+        ));
+    }
+    if !decision.text_to_emit.trim().is_empty() {
+        warn!(
+            "generation decision returned text_to_emit={}, ignoring it",
+            decision.text_to_emit
+        );
+    }
+
+    Ok(SegmentDecision {
+        kind: DecisionKind::Generation,
+        rewrite_scope: crate::models::RewriteScope::Segment,
+        format_kind: crate::models::FormatKind::Plain,
+        text_to_emit: String::new(),
+        keep_block_open: false,
+        actions: Vec::new(),
+        generation_prompt: Some(generation_prompt.to_string()),
+        generation_style: Some(
+            decision
+                .generation_style
+                .unwrap_or(GenerationStyle::Generic),
+        ),
+        replace_current_segment: true,
     })
 }
 
@@ -598,6 +1084,14 @@ fn infer_key_from_spoken_text(text: &str) -> Option<crate::models::ActionKey> {
         "end" => Some(crate::models::ActionKey::End),
         _ => infer_function_key(last),
     }
+}
+
+fn infer_literal_and_key_action(text: &str) -> Option<(String, crate::models::ActionKey)> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let last = tokens.last().copied()?;
+    let key = infer_key_from_spoken_text(last)?;
+    let stripped = tokens[..tokens.len().saturating_sub(1)].join(" ");
+    Some((stripped, key))
 }
 
 fn infer_function_key(token: &str) -> Option<crate::models::ActionKey> {

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{Result, WisprError},
     models::{
-        ActionScope, CommandMode, DeviceChoice, HotkeyBinding, ShortcutDenylistProfile,
-        TextOutputMode,
+        ActionScope, CommandMode, DeviceChoice, GenerationInsertMode, GenerationTargetScope,
+        GenerationTriggerMode, HotkeyBinding, ShortcutDenylistProfile, TextOutputMode,
     },
 };
 
@@ -52,6 +52,7 @@ pub struct IntelligenceConfig {
     pub base_url: String,
     pub model: String,
     pub timeout_ms: u64,
+    pub generation_timeout_ms: u64,
     pub max_recent_chars: usize,
     pub command_mode: CommandMode,
     pub text_output_mode: TextOutputMode,
@@ -62,6 +63,10 @@ pub struct IntelligenceConfig {
     pub shortcut_denylist_profile: ShortcutDenylistProfile,
     pub shortcut_allowlist: Vec<String>,
     pub shortcut_denylist: Vec<String>,
+    pub generation_enabled: bool,
+    pub generation_trigger_mode: GenerationTriggerMode,
+    pub generation_insert_mode: GenerationInsertMode,
+    pub generation_target_scope: GenerationTargetScope,
 }
 
 impl Default for IntelligenceConfig {
@@ -71,6 +76,7 @@ impl Default for IntelligenceConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
             timeout_ms: 2_500,
+            generation_timeout_ms: 120_000,
             max_recent_chars: 256,
             command_mode: CommandMode::AlwaysInfer,
             text_output_mode: TextOutputMode::Literal,
@@ -81,6 +87,10 @@ impl Default for IntelligenceConfig {
             shortcut_denylist_profile: ShortcutDenylistProfile::Minimal,
             shortcut_allowlist: Vec::new(),
             shortcut_denylist: Vec::new(),
+            generation_enabled: true,
+            generation_trigger_mode: GenerationTriggerMode::ExplicitRequests,
+            generation_insert_mode: GenerationInsertMode::ReplaceRequest,
+            generation_target_scope: GenerationTargetScope::AnyTextField,
         }
     }
 }

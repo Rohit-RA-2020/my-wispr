@@ -105,6 +105,8 @@ fn build_ui(app: &adw::Application) {
         .build();
     let llm_timeout_entry = gtk::SpinButton::with_range(250.0, 30_000.0, 250.0);
     llm_timeout_entry.set_value(config.intelligence.timeout_ms as f64);
+    let generation_timeout_entry = gtk::SpinButton::with_range(1_000.0, 600_000.0, 1_000.0);
+    generation_timeout_entry.set_value(config.intelligence.generation_timeout_ms as f64);
     let llm_debug_switch = gtk::Switch::builder()
         .active(config.intelligence.debug_overlay)
         .build();
@@ -118,6 +120,9 @@ fn build_ui(app: &adw::Application) {
         .build();
     let semantic_commands_switch = gtk::Switch::builder()
         .active(config.intelligence.semantic_commands_enabled)
+        .build();
+    let generation_switch = gtk::Switch::builder()
+        .active(config.intelligence.generation_enabled)
         .build();
     let denylist_profile_combo = gtk::ComboBoxText::new();
     denylist_profile_combo.append(Some("minimal"), "Minimal");
@@ -137,7 +142,11 @@ fn build_ui(app: &adw::Application) {
     ));
     intelligence_group.add(&row_with_widget("Base URL", &llm_base_url_entry));
     intelligence_group.add(&row_with_widget("Model", &llm_model_entry));
-    intelligence_group.add(&row_with_widget("Timeout (ms)", &llm_timeout_entry));
+    intelligence_group.add(&row_with_widget("Command Timeout (ms)", &llm_timeout_entry));
+    intelligence_group.add(&row_with_widget(
+        "Generation Timeout (ms)",
+        &generation_timeout_entry,
+    ));
     intelligence_group.add(&row_with_widget(
         "Show Interpreter Status",
         &llm_debug_switch,
@@ -152,11 +161,33 @@ fn build_ui(app: &adw::Application) {
         &semantic_commands_switch,
     ));
     intelligence_group.add(&row_with_widget(
+        "Enable Autonomous Writing",
+        &generation_switch,
+    ));
+    intelligence_group.add(&row_with_widget(
         "Denylist Profile",
         &denylist_profile_combo,
     ));
     intelligence_group.add(&row_with_widget("Shortcut Allowlist", &allowlist_entry));
     intelligence_group.add(&row_with_widget("Shortcut Denylist", &denylist_entry));
+    intelligence_group.add(
+        &adw::ActionRow::builder()
+            .title("Generation Trigger")
+            .subtitle("Explicit requests only")
+            .build(),
+    );
+    intelligence_group.add(
+        &adw::ActionRow::builder()
+            .title("Generation Insert Mode")
+            .subtitle("Replace spoken request with generated text")
+            .build(),
+    );
+    intelligence_group.add(
+        &adw::ActionRow::builder()
+            .title("Generation Target Scope")
+            .subtitle("Any focused text field")
+            .build(),
+    );
 
     let actions_box = gtk::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -204,10 +235,12 @@ fn build_ui(app: &adw::Application) {
         let llm_base_url_entry = llm_base_url_entry.clone();
         let llm_model_entry = llm_model_entry.clone();
         let llm_timeout_entry = llm_timeout_entry.clone();
+        let generation_timeout_entry = generation_timeout_entry.clone();
         let llm_debug_switch = llm_debug_switch.clone();
         let llm_api_key_entry = llm_api_key_entry.clone();
         let dynamic_shortcuts_switch = dynamic_shortcuts_switch.clone();
         let semantic_commands_switch = semantic_commands_switch.clone();
+        let generation_switch = generation_switch.clone();
         let denylist_profile_combo = denylist_profile_combo.clone();
         let allowlist_entry = allowlist_entry.clone();
         let denylist_entry = denylist_entry.clone();
@@ -221,9 +254,11 @@ fn build_ui(app: &adw::Application) {
             config.intelligence.base_url = llm_base_url_entry.text().to_string();
             config.intelligence.model = llm_model_entry.text().to_string();
             config.intelligence.timeout_ms = llm_timeout_entry.value() as u64;
+            config.intelligence.generation_timeout_ms = generation_timeout_entry.value() as u64;
             config.intelligence.debug_overlay = llm_debug_switch.is_active();
             config.intelligence.dynamic_shortcuts_enabled = dynamic_shortcuts_switch.is_active();
             config.intelligence.semantic_commands_enabled = semantic_commands_switch.is_active();
+            config.intelligence.generation_enabled = generation_switch.is_active();
             config.intelligence.shortcut_denylist_profile =
                 parse_denylist_profile(denylist_profile_combo.active_id().as_deref());
             config.intelligence.shortcut_allowlist =
@@ -275,10 +310,12 @@ fn build_ui(app: &adw::Application) {
         let llm_base_url_entry = llm_base_url_entry.clone();
         let llm_model_entry = llm_model_entry.clone();
         let llm_timeout_entry = llm_timeout_entry.clone();
+        let generation_timeout_entry = generation_timeout_entry.clone();
         let llm_debug_switch = llm_debug_switch.clone();
         let llm_api_key_entry = llm_api_key_entry.clone();
         let dynamic_shortcuts_switch = dynamic_shortcuts_switch.clone();
         let semantic_commands_switch = semantic_commands_switch.clone();
+        let generation_switch = generation_switch.clone();
         let denylist_profile_combo = denylist_profile_combo.clone();
         let allowlist_entry = allowlist_entry.clone();
         let denylist_entry = denylist_entry.clone();
@@ -288,9 +325,11 @@ fn build_ui(app: &adw::Application) {
             config.intelligence.base_url = llm_base_url_entry.text().to_string();
             config.intelligence.model = llm_model_entry.text().to_string();
             config.intelligence.timeout_ms = llm_timeout_entry.value() as u64;
+            config.intelligence.generation_timeout_ms = generation_timeout_entry.value() as u64;
             config.intelligence.debug_overlay = llm_debug_switch.is_active();
             config.intelligence.dynamic_shortcuts_enabled = dynamic_shortcuts_switch.is_active();
             config.intelligence.semantic_commands_enabled = semantic_commands_switch.is_active();
+            config.intelligence.generation_enabled = generation_switch.is_active();
             config.intelligence.shortcut_denylist_profile =
                 parse_denylist_profile(denylist_profile_combo.active_id().as_deref());
             config.intelligence.shortcut_allowlist =
@@ -377,9 +416,15 @@ fn test_llm(config: AppConfig, llm_api_key: &str) -> Result<String> {
         let interpreter = LlmInterpreter::new(config.intelligence.clone(), llm_api_key.trim())?;
         let result = interpreter.test_connection().await?;
         Ok(format!(
-            "LLM test succeeded. Decision: {} | Text: {}",
+            "LLM test succeeded. Decision: {} | Text: {}{}",
             result.decision.kind.as_label(),
-            result.decision.text_to_emit
+            result.decision.text_to_emit,
+            result
+                .decision
+                .generation_prompt
+                .as_ref()
+                .map(|prompt| format!(" | Generation prompt: {prompt}"))
+                .unwrap_or_default(),
         ))
     })
 }
@@ -453,13 +498,14 @@ fn enumerate_devices() -> Result<Vec<wispr_core::DeviceChoice>> {
 
 fn format_status(status: &DaemonStatus) -> String {
     format!(
-        "State: {:?} | Mic ready: {} | Typing ready: {} | Hotkey ready: {} | Intelligence ready: {} | LLM ready: {}{}{}{}{}{}{}",
+        "State: {:?} | Mic ready: {} | Typing ready: {} | Hotkey ready: {} | Intelligence ready: {} | LLM ready: {} | Generation ready: {}{}{}{}{}{}{}{}{}",
         status.state,
         status.mic_ready,
         status.typing_ready,
         status.hotkey_ready,
         status.intelligence_ready,
         status.llm_ready,
+        status.generation_ready,
         status
             .current_mic
             .as_ref()
@@ -474,6 +520,16 @@ fn format_status(status: &DaemonStatus) -> String {
             .last_llm_error
             .as_ref()
             .map(|err| format!(" | LLM error: {err}"))
+            .unwrap_or_default(),
+        status
+            .generation_state
+            .as_ref()
+            .map(|value| format!(" | Generation: {value}"))
+            .unwrap_or_default(),
+        status
+            .last_generation_error
+            .as_ref()
+            .map(|err| format!(" | Generation error: {err}"))
             .unwrap_or_default(),
         status
             .last_error
