@@ -941,14 +941,21 @@ fn validate_decision(
 
     if !decision.actions.is_empty() {
         let mut action_text = normalized_text;
+        if let Some(stripped_text) =
+            strip_explicit_action_command(&request.finalized_text, &decision.actions)
+        {
+            action_text = normalize_command_text(&stripped_text);
+        }
         if let Some((stripped_text, inferred_key)) =
             infer_literal_and_key_action(&request.finalized_text)
         {
-            if decision.actions.iter().any(|action| {
-                action.action_type == ActionType::Key
-                    && action.key == Some(inferred_key.clone())
-                    && action.modifiers.is_empty()
-            }) {
+            if !action_text.is_empty()
+                && decision.actions.iter().any(|action| {
+                    action.action_type == ActionType::Key
+                        && action.key == Some(inferred_key.clone())
+                        && action.modifiers.is_empty()
+                })
+            {
                 action_text = normalize_command_text(&stripped_text);
             }
         }
@@ -1065,33 +1072,210 @@ fn hydrate_missing_actions(request: &SegmentDecisionRequest, decision: &mut Segm
 }
 
 fn infer_key_from_spoken_text(text: &str) -> Option<crate::models::ActionKey> {
-    let normalized = text.trim().to_ascii_lowercase();
-    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let tokens = spoken_tokens(text);
+    let Some(last_meaningful) = tokens
+        .iter()
+        .rev()
+        .find(|token| !matches!(token.as_str(), "key" | "button" | "please"))
+    else {
+        return None;
+    };
+    infer_key_from_token(last_meaningful)
+}
 
-    let last = tokens.last().copied().unwrap_or_default();
-    match last {
+fn infer_literal_and_key_action(text: &str) -> Option<(String, crate::models::ActionKey)> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let normalized = spoken_tokens(text);
+    let mut end = normalized.len();
+    while end > 0 && matches!(normalized[end - 1].as_str(), "key" | "button" | "please") {
+        end -= 1;
+    }
+    let key = infer_key_from_token(normalized.get(end.checked_sub(1)?)?)?;
+
+    let mut prefix_end = end.saturating_sub(1);
+    if prefix_end > 0 && normalized[prefix_end - 1] == "the" {
+        prefix_end -= 1;
+    }
+    let stripped = tokens[..prefix_end.min(tokens.len())].join(" ");
+    Some((stripped, key))
+}
+
+fn strip_explicit_action_command(text: &str, actions: &[ActionCommand]) -> Option<String> {
+    if actions.len() != 1 {
+        return None;
+    }
+
+    let action = &actions[0];
+    let tokens = spoken_tokens(text);
+    if tokens.is_empty() || !tokens.iter().any(|token| is_action_wrapper_token(token)) {
+        return None;
+    }
+
+    let mut saw_key = false;
+    let mut saw_modifier = action.modifiers.is_empty();
+
+    for token in &tokens {
+        if is_action_wrapper_token(token) || is_repeat_token(token) {
+            continue;
+        }
+        if action
+            .key
+            .as_ref()
+            .is_some_and(|key| token_matches_action_key(token, key))
+        {
+            saw_key = true;
+            continue;
+        }
+        if action
+            .modifiers
+            .iter()
+            .any(|modifier| token_matches_modifier(token, modifier))
+        {
+            saw_modifier = true;
+            continue;
+        }
+        return None;
+    }
+
+    if saw_key && saw_modifier {
+        Some(String::new())
+    } else {
+        None
+    }
+}
+
+fn spoken_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn infer_key_from_token(token: &str) -> Option<crate::models::ActionKey> {
+    match token {
         "enter" | "return" => Some(crate::models::ActionKey::Enter),
         "tab" => Some(crate::models::ActionKey::Tab),
         "escape" | "esc" => Some(crate::models::ActionKey::Escape),
         "backspace" => Some(crate::models::ActionKey::Backspace),
         "delete" => Some(crate::models::ActionKey::Delete),
-        "space" => Some(crate::models::ActionKey::Space),
+        "space" | "spacebar" => Some(crate::models::ActionKey::Space),
         "left" => Some(crate::models::ActionKey::Left),
         "right" => Some(crate::models::ActionKey::Right),
         "up" => Some(crate::models::ActionKey::Up),
         "down" => Some(crate::models::ActionKey::Down),
         "home" => Some(crate::models::ActionKey::Home),
         "end" => Some(crate::models::ActionKey::End),
-        _ => infer_function_key(last),
+        _ => infer_function_key(token),
     }
 }
 
-fn infer_literal_and_key_action(text: &str) -> Option<(String, crate::models::ActionKey)> {
-    let tokens = text.split_whitespace().collect::<Vec<_>>();
-    let last = tokens.last().copied()?;
-    let key = infer_key_from_spoken_text(last)?;
-    let stripped = tokens[..tokens.len().saturating_sub(1)].join(" ");
-    Some((stripped, key))
+fn is_action_wrapper_token(token: &str) -> bool {
+    matches!(
+        token,
+        "press" | "hit" | "tap" | "click" | "send" | "the" | "key" | "button" | "please"
+    )
+}
+
+fn is_repeat_token(token: &str) -> bool {
+    matches!(
+        token,
+        "once"
+            | "twice"
+            | "thrice"
+            | "time"
+            | "times"
+            | "one"
+            | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "ten"
+    )
+}
+
+fn token_matches_modifier(token: &str, modifier: &ModifierKey) -> bool {
+    match modifier {
+        ModifierKey::Ctrl => matches!(token, "control" | "ctrl"),
+        ModifierKey::Shift => token == "shift",
+        ModifierKey::Alt => token == "alt",
+        ModifierKey::Super => matches!(token, "super" | "meta" | "windows"),
+    }
+}
+
+fn token_matches_action_key(token: &str, key: &crate::models::ActionKey) -> bool {
+    match key {
+        crate::models::ActionKey::Space => matches!(token, "space" | "spacebar"),
+        crate::models::ActionKey::Enter => matches!(token, "enter" | "return"),
+        crate::models::ActionKey::Tab => token == "tab",
+        crate::models::ActionKey::Escape => matches!(token, "escape" | "esc"),
+        crate::models::ActionKey::Backspace => token == "backspace",
+        crate::models::ActionKey::Delete => token == "delete",
+        crate::models::ActionKey::Insert => token == "insert",
+        crate::models::ActionKey::Left => token == "left",
+        crate::models::ActionKey::Right => token == "right",
+        crate::models::ActionKey::Up => token == "up",
+        crate::models::ActionKey::Down => token == "down",
+        crate::models::ActionKey::Home => token == "home",
+        crate::models::ActionKey::End => token == "end",
+        crate::models::ActionKey::PageUp => matches!(token, "pageup" | "page"),
+        crate::models::ActionKey::PageDown => matches!(token, "pagedown" | "page"),
+        crate::models::ActionKey::A => token == "a",
+        crate::models::ActionKey::B => token == "b",
+        crate::models::ActionKey::C => token == "c",
+        crate::models::ActionKey::D => token == "d",
+        crate::models::ActionKey::E => token == "e",
+        crate::models::ActionKey::F => token == "f",
+        crate::models::ActionKey::G => token == "g",
+        crate::models::ActionKey::H => token == "h",
+        crate::models::ActionKey::I => token == "i",
+        crate::models::ActionKey::J => token == "j",
+        crate::models::ActionKey::K => token == "k",
+        crate::models::ActionKey::L => token == "l",
+        crate::models::ActionKey::M => token == "m",
+        crate::models::ActionKey::N => token == "n",
+        crate::models::ActionKey::O => token == "o",
+        crate::models::ActionKey::P => token == "p",
+        crate::models::ActionKey::Q => token == "q",
+        crate::models::ActionKey::R => token == "r",
+        crate::models::ActionKey::S => token == "s",
+        crate::models::ActionKey::T => token == "t",
+        crate::models::ActionKey::U => token == "u",
+        crate::models::ActionKey::V => token == "v",
+        crate::models::ActionKey::W => token == "w",
+        crate::models::ActionKey::X => token == "x",
+        crate::models::ActionKey::Y => token == "y",
+        crate::models::ActionKey::Z => token == "z",
+        crate::models::ActionKey::Digit0 => matches!(token, "0" | "zero"),
+        crate::models::ActionKey::Digit1 => matches!(token, "1" | "one"),
+        crate::models::ActionKey::Digit2 => matches!(token, "2" | "two"),
+        crate::models::ActionKey::Digit3 => matches!(token, "3" | "three"),
+        crate::models::ActionKey::Digit4 => matches!(token, "4" | "four"),
+        crate::models::ActionKey::Digit5 => matches!(token, "5" | "five"),
+        crate::models::ActionKey::Digit6 => matches!(token, "6" | "six"),
+        crate::models::ActionKey::Digit7 => matches!(token, "7" | "seven"),
+        crate::models::ActionKey::Digit8 => matches!(token, "8" | "eight"),
+        crate::models::ActionKey::Digit9 => matches!(token, "9" | "nine"),
+        crate::models::ActionKey::F1 => token == "f1",
+        crate::models::ActionKey::F2 => token == "f2",
+        crate::models::ActionKey::F3 => token == "f3",
+        crate::models::ActionKey::F4 => token == "f4",
+        crate::models::ActionKey::F5 => token == "f5",
+        crate::models::ActionKey::F6 => token == "f6",
+        crate::models::ActionKey::F7 => token == "f7",
+        crate::models::ActionKey::F8 => token == "f8",
+        crate::models::ActionKey::F9 => token == "f9",
+        crate::models::ActionKey::F10 => token == "f10",
+        crate::models::ActionKey::F11 => token == "f11",
+        crate::models::ActionKey::F12 => token == "f12",
+    }
 }
 
 fn infer_function_key(token: &str) -> Option<crate::models::ActionKey> {
