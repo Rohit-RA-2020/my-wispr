@@ -1232,6 +1232,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3146,6 +3152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webrtc-vad"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39a1e40fd6ca90be95459152a2537f2ba4286ee1b13073f7ebcaa74fc94e3008"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3314,6 +3329,7 @@ dependencies = [
  "dirs",
  "evdev",
  "futures-util",
+ "hound",
  "reqwest",
  "secret-service",
  "serde",
@@ -3323,6 +3339,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "webrtc-vad",
  "zbus",
  "zvariant",
 ]
@@ -3365,6 +3382,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gtk4",
+ "hound",
  "libadwaita",
  "rustls",
  "serde",
@@ -3376,6 +3394,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webrtc-vad",
  "wispr-core",
  "zbus",
  "zvariant",

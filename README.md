@@ -1,6 +1,6 @@
 # Wispr
 
-Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, streams live audio to Deepgram, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, formatted text, or autonomous generated writing instead of literal text.
+Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, transcribes speech either through Deepgram or a local Whisper backend, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, formatted text, or autonomous generated writing instead of literal text.
 
 This repository currently targets Ubuntu GNOME on Wayland.
 
@@ -13,6 +13,8 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - the Deepgram API key and LLM API key are stored in GNOME Secret Service, not in the config file
 - direct typing uses `/dev/uinput`
 - live capture currently uses `pw-record` for the audio stream and GStreamer only for device enumeration
+- transcription can run either through Deepgram streaming or through local Whisper turn-by-turn transcription
+- local Whisper is English-only in v1, does not emit live partials, and manages models under `~/.local/share/wispr/whisper`
 - finalized transcript segments can be passed through an OpenAI-compatible `responses` backend for structured command interpretation
 - the LLM layer supports literal dictation, editing actions, semantic commands, block formatting, autonomous writing mode, and literal text plus actions in the same spoken segment
 
@@ -21,6 +23,7 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - live dictation into the focused app
 - configurable microphone selection with persistent device choice
 - Deepgram speech-to-text streaming
+- local Whisper speech-to-text with selectable model, download/delete controls, and no cloud dependency after model download
 - OpenAI-compatible command interpretation with configurable base URL, model, and API key
 - spoken editing commands such as `hello enter`, `select all`, `copy`, `paste`, `undo`, and `redo`
 - dynamic spoken shortcuts such as `press control t`, `press control shift p`, `press alt tab`, and `press super left`
@@ -36,7 +39,7 @@ This repository currently targets Ubuntu GNOME on Wayland.
 ## Workspace Layout
 
 - `crates/wispr-core`: shared config, models, D-Bus interface, secret storage, typing diffing, and install helpers
-- `bins/wisprd`: background daemon, Deepgram streaming client, audio capture, overlay, and shortcut handling
+- `bins/wisprd`: background daemon, Deepgram and Whisper transcription backends, audio capture, overlay, and shortcut handling
 - `bins/wispr-settings`: GTK4/libadwaita settings window
 - `bins/wisprctl`: CLI for daemon control, autostart install, default config generation, and `/dev/uinput` setup
 - `assets/systemd/wisprd.service`: user service template
@@ -51,7 +54,8 @@ Wispr expects these tools or services to exist at runtime:
 - GNOME Secret Service
 - `systemd --user`
 - `/dev/uinput`
-- a Deepgram API key
+- a Deepgram API key for cloud transcription
+- `python3`, `python3-venv`, and `ffmpeg` for local transcription
 - an OpenAI-compatible LLM API key if intelligence is enabled
 
 ## Build Dependencies
@@ -60,10 +64,20 @@ Install the native packages Wispr needs on Ubuntu:
 
 ```bash
 sudo apt-get install -y \
-  cargo rustc pkg-config \
+  cargo rustc pkg-config python3 ffmpeg \
   libgtk-4-dev libadwaita-1-dev libgraphene-1.0-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libpipewire-0.3-dev
+```
+
+For local Whisper transcription, Wispr uses a dedicated virtual environment at
+`~/.local/share/wispr/whisper-venv`. You can create it from the settings UI with
+the `Install Whisper` button, or prepare it manually:
+
+```bash
+python3 -m venv ~/.local/share/wispr/whisper-venv
+~/.local/share/wispr/whisper-venv/bin/pip install -U pip wheel
+~/.local/share/wispr/whisper-venv/bin/pip install -U openai-whisper
 ```
 
 ## Build
@@ -128,7 +142,9 @@ sudo ~/.local/bin/wisprctl setup-uinput
 
 Then:
 
-- store your Deepgram API key
+- choose `Cloud (Deepgram)` or `Local (Whisper)` as the transcription backend
+- store your Deepgram API key if you use cloud transcription
+- install/download a Whisper model if you use local transcription
 - optionally enable Intelligence and store your LLM API key
 - set the LLM base URL and model if you are not using the default OpenAI endpoint
 - select the microphone you want to use

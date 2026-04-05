@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{Result, WisprError},
     models::{
-        ActionScope, CommandMode, DeviceChoice, GenerationInsertMode, GenerationTargetScope,
-        GenerationTriggerMode, HotkeyBinding, ShortcutDenylistProfile, TextOutputMode,
+        ActionScope, CommandMode, DeepgramConfig, DeviceChoice, GenerationInsertMode,
+        GenerationTargetScope, GenerationTriggerMode, HotkeyBinding, ShortcutDenylistProfile,
+        TextOutputMode, TranscriptionProvider, WhisperLocalConfig,
     },
 };
 
@@ -97,9 +98,28 @@ impl Default for IntelligenceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TranscriptionConfig {
+    pub provider: TranscriptionProvider,
+    pub deepgram: DeepgramConfig,
+    pub whisper_local: WhisperLocalConfig,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            provider: TranscriptionProvider::Deepgram,
+            deepgram: DeepgramConfig::default(),
+            whisper_local: WhisperLocalConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub overlay: OverlayConfig,
     pub typing: TypingConfig,
+    pub transcription: TranscriptionConfig,
     pub intelligence: IntelligenceConfig,
     pub autostart: bool,
     pub selected_device: Option<DeviceChoice>,
@@ -111,6 +131,7 @@ impl Default for AppConfig {
         Self {
             overlay: OverlayConfig::default(),
             typing: TypingConfig::default(),
+            transcription: TranscriptionConfig::default(),
             intelligence: IntelligenceConfig::default(),
             autostart: true,
             selected_device: None,
@@ -157,5 +178,35 @@ impl AppConfig {
         let toml = toml::to_string_pretty(self)?;
         fs::write(path, toml)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TranscriptionProvider;
+
+    #[test]
+    fn config_round_trip_preserves_transcription_settings() {
+        let mut config = AppConfig::default();
+        config.transcription.provider = TranscriptionProvider::WhisperLocal;
+        config.transcription.whisper_local.model = "small.en".to_string();
+
+        let toml = toml::to_string_pretty(&config).expect("serialize config");
+        let parsed = toml::from_str::<AppConfig>(&toml).expect("parse config");
+
+        assert_eq!(
+            parsed.transcription.provider,
+            TranscriptionProvider::WhisperLocal
+        );
+        assert_eq!(parsed.transcription.whisper_local.model, "small.en");
+        assert!(
+            !parsed
+                .transcription
+                .whisper_local
+                .model_dir
+                .as_os_str()
+                .is_empty()
+        );
     }
 }

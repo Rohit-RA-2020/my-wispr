@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DictationState {
@@ -33,6 +34,39 @@ pub struct DeviceChoice {
     pub node_name: String,
     pub display_name: String,
     pub fallback_description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionProvider {
+    Deepgram,
+    WhisperLocal,
+}
+
+impl Default for TranscriptionProvider {
+    fn default() -> Self {
+        Self::Deepgram
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DeepgramConfig {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WhisperLocalConfig {
+    pub model: String,
+    pub model_dir: PathBuf,
+}
+
+impl Default for WhisperLocalConfig {
+    fn default() -> Self {
+        Self {
+            model: "base.en".to_string(),
+            model_dir: crate::whisper::default_model_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,11 +479,17 @@ pub struct SegmentDecisionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DaemonStatus {
     pub state: DictationState,
     pub mic_ready: bool,
     pub typing_ready: bool,
     pub hotkey_ready: bool,
+    pub transcription_provider: TranscriptionProvider,
+    pub transcription_ready: bool,
+    pub transcription_state: Option<String>,
+    pub selected_whisper_model: Option<String>,
+    pub last_transcription_error: Option<String>,
     pub intelligence_ready: bool,
     pub llm_ready: bool,
     pub current_mic: Option<DeviceChoice>,
@@ -474,6 +514,11 @@ impl Default for DaemonStatus {
             mic_ready: false,
             typing_ready: false,
             hotkey_ready: false,
+            transcription_provider: TranscriptionProvider::Deepgram,
+            transcription_ready: false,
+            transcription_state: None,
+            selected_whisper_model: None,
+            last_transcription_error: None,
             intelligence_ready: false,
             llm_ready: false,
             current_mic: None,

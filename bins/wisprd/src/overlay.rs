@@ -72,6 +72,12 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .build();
+    let transcription_label = gtk::Label::builder()
+        .xalign(0.0)
+        .halign(Align::Start)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
     let intelligence_label = gtk::Label::builder()
         .xalign(0.0)
         .halign(Align::Start)
@@ -94,6 +100,7 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
     container.append(&state_label);
     container.append(&mic_label);
     container.append(&transcript_label);
+    container.append(&transcription_label);
     container.append(&intelligence_label);
     container.append(&generation_label);
     container.append(&context_label);
@@ -118,6 +125,23 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
                 .unwrap_or_else(|| "Mic: not selected".to_string()),
         );
         transcript_label.set_label(status.partial_transcript.as_deref().unwrap_or(""));
+        transcription_label.set_label(
+            &status
+                .transcription_state
+                .as_ref()
+                .map(|state| format!("Transcription: {state}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "Transcription: {}",
+                        match status.transcription_provider {
+                            wispr_core::models::TranscriptionProvider::Deepgram =>
+                                "Cloud (Deepgram)",
+                            wispr_core::models::TranscriptionProvider::WhisperLocal =>
+                                "Local (Whisper)",
+                        }
+                    )
+                }),
+        );
         intelligence_label.set_label(
             &status
                 .intelligence_state

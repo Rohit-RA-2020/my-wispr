@@ -9,6 +9,7 @@ pub mod models;
 pub mod secrets;
 pub mod shortcuts;
 pub mod typing;
+pub mod whisper;
 
 pub use config::AppConfig;
 pub use error::{Result, WisprError};
@@ -16,10 +17,10 @@ pub use ipc::{DICTATION_INTERFACE, DICTATION_OBJECT_PATH, DICTATION_SERVICE, Dic
 pub use llm::{InterpreterOutput, LlmInterpreter};
 pub use models::{
     ActionCommand, ActionKey, ActionScope, ActionType, ActiveAppClass, ActiveAppContext,
-    CommandMode, CorrectionScope, DaemonStatus, DecisionKind, DeviceChoice, DictationState,
-    FormatKind, FormattingTriggerPolicy, GenerationInsertMode, GenerationRequest, GenerationStyle,
-    GenerationTargetScope, GenerationTriggerMode, HotkeyBinding, ModifierKey, PreferredListStyle,
-    RewriteScope, SegmentDecision, SegmentDecisionRequest, SemanticCommandId,
-    ShortcutDenylistProfile, TextOutputMode,
+    CommandMode, CorrectionScope, DaemonStatus, DecisionKind, DeepgramConfig, DeviceChoice,
+    DictationState, FormatKind, FormattingTriggerPolicy, GenerationInsertMode, GenerationRequest,
+    GenerationStyle, GenerationTargetScope, GenerationTriggerMode, HotkeyBinding, ModifierKey,
+    PreferredListStyle, RewriteScope, SegmentDecision, SegmentDecisionRequest, SemanticCommandId,
+    ShortcutDenylistProfile, TextOutputMode, TranscriptionProvider, WhisperLocalConfig,
 };
 pub use shortcuts::{ResolvedActions, resolve_actions};

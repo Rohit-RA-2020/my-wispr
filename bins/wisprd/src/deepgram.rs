@@ -34,6 +34,7 @@ pub enum TranscriptEvent {
     Final(TranscriptChunk),
     TurnEnded,
     TurnEndedWithTranscript(TranscriptChunk),
+    BackendState(String),
     Warning(String),
 }
 

@@ -1,6 +1,7 @@
 mod app_context;
 mod audio;
 mod deepgram;
+mod local_whisper;
 mod overlay;
 mod portal;
 
@@ -17,16 +18,21 @@ use std::{
 use audio::{AudioCapture, resolve_selected_device};
 use chrono::Utc;
 use deepgram::{DeepgramSession, TranscriptChunk, TranscriptEvent};
-use tokio::sync::{Mutex, RwLock, oneshot};
+use local_whisper::LocalWhisperSession;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
 use wispr_core::{
     AppConfig, CorrectionScope, DecisionKind, FormattingTriggerPolicy, GenerationRequest,
     LlmInterpreter, PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
-    models::{ActiveAppContext, DaemonStatus, DeviceChoice, DictationState, FormatKind},
+    models::{
+        ActiveAppContext, DaemonStatus, DeviceChoice, DictationState, FormatKind,
+        TranscriptionProvider,
+    },
     resolve_actions,
     secrets::SecretStore,
     typing::{UInputKeyboard, diff_patch},
+    whisper,
 };
 use zbus::connection::Builder as ConnectionBuilder;
 
@@ -45,6 +51,17 @@ struct RunningSession {
     cancel_flag: Arc<AtomicBool>,
 }
 
+struct DeepgramBackend {
+    session: DeepgramSession,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    pending_audio: Vec<u8>,
+}
+
+enum TranscriptionBackend {
+    Deepgram(DeepgramBackend),
+    WhisperLocal(LocalWhisperSession),
+}
+
 #[derive(Clone, Debug)]
 struct FormattingBlock {
     raw_text: String,
@@ -58,6 +75,11 @@ struct StatusUpdate {
     current_mic: Option<Option<DeviceChoice>>,
     partial_transcript: Option<Option<String>>,
     last_error: Option<Option<String>>,
+    transcription_provider: Option<TranscriptionProvider>,
+    transcription_ready: Option<bool>,
+    transcription_state: Option<Option<String>>,
+    selected_whisper_model: Option<Option<String>>,
+    last_transcription_error: Option<Option<String>>,
     intelligence_ready: Option<bool>,
     llm_ready: Option<bool>,
     last_llm_error: Option<Option<String>>,
@@ -108,6 +130,47 @@ impl DictationDbus {
         match status {
             Ok(_) => "Opened settings".to_string(),
             Err(error) => format!("Failed to open settings: {error}"),
+        }
+    }
+}
+
+impl TranscriptionBackend {
+    async fn submit_audio(&mut self, frame: Vec<u8>) -> Result<()> {
+        match self {
+            Self::Deepgram(backend) => {
+                backend.pending_audio.extend_from_slice(&frame);
+                while backend.pending_audio.len() >= DEEPGRAM_FRAME_BYTES {
+                    let chunk = backend
+                        .pending_audio
+                        .drain(..DEEPGRAM_FRAME_BYTES)
+                        .collect::<Vec<u8>>();
+                    backend.audio_tx.send(chunk).await.map_err(|_| {
+                        WisprError::InvalidState("Failed to forward audio to Deepgram".to_string())
+                    })?;
+                }
+                Ok(())
+            }
+            Self::WhisperLocal(session) => session.submit_audio(frame).await,
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<TranscriptEvent> {
+        match self {
+            Self::Deepgram(backend) => backend.session.next_event().await,
+            Self::WhisperLocal(session) => session.next_event().await,
+        }
+    }
+
+    async fn close(&mut self) {
+        match self {
+            Self::Deepgram(backend) => {
+                if !backend.pending_audio.is_empty() {
+                    let chunk = std::mem::take(&mut backend.pending_audio);
+                    let _ = backend.audio_tx.send(chunk).await;
+                }
+                backend.session.close_stream();
+            }
+            Self::WhisperLocal(session) => session.close(),
         }
     }
 }
@@ -195,11 +258,6 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
     })?;
 
     let secret_store = SecretStore::connect().await?;
-    let api_key = secret_store.get_api_key().await?.ok_or_else(|| {
-        WisprError::InvalidState(
-            "No Deepgram API key is stored yet. Open wispr-settings first.".to_string(),
-        )
-    })?;
     let mut keyboard = wispr_core::typing::UInputKeyboard::open().map_err(|error| {
         WisprError::InvalidState(format!("Typing engine failed to open /dev/uinput: {error}"))
     })?;
@@ -217,17 +275,25 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
 
     let capture = AudioCapture::start(&selected)?;
     let audio_rx = capture.receiver();
-    let mut deepgram = DeepgramSession::connect(&api_key).await?;
-    let audio_tx = deepgram.audio_sender();
+    let transcription = build_transcription_backend(&config, &secret_store).await?;
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
+    let transcription_label = active_transcription_label(&config);
 
     publish_status(
         &state,
         StatusUpdate {
             state: Some(DictationState::Listening),
             current_mic: Some(Some(selected.clone())),
-            partial_transcript: Some(Some(String::new())),
+            partial_transcript: Some(match config.transcription.provider {
+                TranscriptionProvider::Deepgram => Some(String::new()),
+                TranscriptionProvider::WhisperLocal => None,
+            }),
+            transcription_provider: Some(config.transcription.provider.clone()),
+            transcription_ready: Some(true),
+            transcription_state: Some(Some(transcription_label)),
+            selected_whisper_model: Some(selected_whisper_model(&config)),
+            last_transcription_error: Some(None),
             intelligence_ready: Some(intelligence_ready),
             llm_ready: Some(llm_ready),
             last_error: Some(None),
@@ -266,22 +332,18 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
         let mut committed_prefix = String::new();
         let mut active_block = None::<FormattingBlock>;
         let mut active_turn = String::new();
-        let mut pending_audio = Vec::new();
         let mut logged_audio = false;
         let mut shutting_down = false;
         let mut shutdown_deadline = None::<Instant>;
         let mut processed_finals = HashSet::<String>::new();
         let llm_interpreter = llm_state;
+        let mut transcription = transcription;
 
         loop {
             tokio::select! {
                 _ = &mut stop_rx, if !shutting_down => {
-                    if !pending_audio.is_empty() {
-                        let _ = audio_tx.send(pending_audio.clone()).await;
-                        pending_audio.clear();
-                    }
                     let _ = capture.stop();
-                    deepgram.close_stream();
+                    transcription.close().await;
                     shutting_down = true;
                     shutdown_deadline = Some(Instant::now() + Duration::from_secs(2));
                 }
@@ -292,23 +354,21 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 info!("audio frame received: {} bytes", frame.len());
                                 logged_audio = true;
                             }
-
-                            pending_audio.extend_from_slice(&frame);
-                            while pending_audio.len() >= DEEPGRAM_FRAME_BYTES {
-                                let chunk = pending_audio.drain(..DEEPGRAM_FRAME_BYTES).collect::<Vec<u8>>();
-                                if audio_tx.send(chunk).await.is_err() {
-                                    publish_status(
-                                        &state_for_task,
-                                        StatusUpdate {
-                                            state: Some(DictationState::Error),
-                                            last_error: Some(Some("Failed to forward audio to Deepgram".to_string())),
-                                            generation_active: Some(false),
-                                            ..StatusUpdate::default()
-                                        },
-                                    )
-                                    .await;
-                                    break;
-                                }
+                            if let Err(error) = transcription.submit_audio(frame).await {
+                                publish_status(
+                                    &state_for_task,
+                                    StatusUpdate {
+                                        state: Some(DictationState::Error),
+                                        last_error: Some(Some(error.to_string())),
+                                        last_transcription_error: Some(Some(error.to_string())),
+                                        generation_active: Some(false),
+                                        ..StatusUpdate::default()
+                                    },
+                                )
+                                .await;
+                                let mut guard = state_for_task.session.lock().await;
+                                *guard = None;
+                                break;
                             }
                         }
                         Err(_) => {
@@ -328,13 +388,14 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                         }
                     }
                 }
-                maybe_event = deepgram.next_event() => {
+                maybe_event = transcription.next_event() => {
                     let Some(event) = maybe_event else {
                         publish_status(
                             &state_for_task,
                             StatusUpdate {
                                 state: Some(DictationState::Idle),
                                 partial_transcript: Some(None),
+                                transcription_state: Some(None),
                                 intelligence_state: Some(None),
                                 active_app: Some(None),
                                 last_resolution: Some(None),
@@ -349,6 +410,16 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                     };
 
                     match event {
+                        TranscriptEvent::BackendState(message) => {
+                            publish_status(
+                                &state_for_task,
+                                StatusUpdate {
+                                    transcription_state: Some(Some(message)),
+                                    ..StatusUpdate::default()
+                                },
+                            )
+                            .await;
+                        }
                         TranscriptEvent::Partial(chunk) => {
                             info!("deepgram partial: {}", chunk.text);
                             let previous_rendered =
@@ -426,7 +497,8 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                                 &state_for_task,
                                 StatusUpdate {
                                     state: Some(DictationState::Error),
-                                    last_error: Some(Some(message)),
+                                    last_error: Some(Some(message.clone())),
+                                    last_transcription_error: Some(Some(message)),
                                     generation_active: Some(false),
                                     ..StatusUpdate::default()
                                 },
@@ -448,6 +520,7 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
                         StatusUpdate {
                             state: Some(DictationState::Idle),
                             partial_transcript: Some(None),
+                            transcription_state: Some(None),
                             intelligence_state: Some(None),
                             active_app: Some(None),
                             last_resolution: Some(None),
@@ -942,6 +1015,9 @@ async fn build_status(
     error: Option<String>,
 ) -> DaemonStatus {
     let config = state.config.read().await.clone();
+    let transcription_provider = config.transcription.provider.clone();
+    let (transcription_ready, transcription_state, last_transcription_error) =
+        build_transcription_status(&config).await;
     let llm_ready = match SecretStore::connect().await {
         Ok(store) if config.intelligence.enabled => store
             .get_llm_api_key()
@@ -963,6 +1039,11 @@ async fn build_status(
             .open("/dev/uinput")
             .is_ok(),
         hotkey_ready: *state.hotkey_ready.read().await,
+        transcription_provider,
+        transcription_ready,
+        transcription_state,
+        selected_whisper_model: selected_whisper_model(&config),
+        last_transcription_error,
         intelligence_ready: !config.intelligence.enabled || llm_ready,
         llm_ready,
         current_mic: config.selected_device.clone(),
@@ -1032,6 +1113,21 @@ async fn publish_status(state: &Arc<AppState>, update: StatusUpdate) {
     }
     if let Some(last_error) = update.last_error {
         status.last_error = last_error;
+    }
+    if let Some(transcription_provider) = update.transcription_provider {
+        status.transcription_provider = transcription_provider;
+    }
+    if let Some(transcription_ready) = update.transcription_ready {
+        status.transcription_ready = transcription_ready;
+    }
+    if let Some(transcription_state) = update.transcription_state {
+        status.transcription_state = transcription_state;
+    }
+    if let Some(selected_whisper_model) = update.selected_whisper_model {
+        status.selected_whisper_model = selected_whisper_model;
+    }
+    if let Some(last_transcription_error) = update.last_transcription_error {
+        status.last_transcription_error = last_transcription_error;
     }
     if let Some(intelligence_ready) = update.intelligence_ready {
         status.intelligence_ready = intelligence_ready;
@@ -1218,4 +1314,94 @@ fn recent_text_window(text: &str, max_chars: usize) -> String {
     let chars = text.chars().collect::<Vec<_>>();
     let start = chars.len().saturating_sub(max_chars);
     chars[start..].iter().collect()
+}
+
+async fn build_transcription_backend(
+    config: &AppConfig,
+    secret_store: &SecretStore,
+) -> Result<TranscriptionBackend> {
+    match &config.transcription.provider {
+        TranscriptionProvider::Deepgram => {
+            let api_key = secret_store.get_api_key().await?.ok_or_else(|| {
+                WisprError::InvalidState(
+                    "No Deepgram API key is stored yet. Open wispr-settings first.".to_string(),
+                )
+            })?;
+            let session = DeepgramSession::connect(&api_key).await?;
+            let audio_tx = session.audio_sender();
+            Ok(TranscriptionBackend::Deepgram(DeepgramBackend {
+                session,
+                audio_tx,
+                pending_audio: Vec::new(),
+            }))
+        }
+        TranscriptionProvider::WhisperLocal => Ok(TranscriptionBackend::WhisperLocal(
+            LocalWhisperSession::connect(config.transcription.whisper_local.clone()).await?,
+        )),
+    }
+}
+
+async fn build_transcription_status(config: &AppConfig) -> (bool, Option<String>, Option<String>) {
+    match &config.transcription.provider {
+        TranscriptionProvider::Deepgram => {
+            let ready = match SecretStore::connect().await {
+                Ok(store) => store
+                    .get_api_key()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|key| !key.trim().is_empty())
+                    .unwrap_or(false),
+                Err(_) => false,
+            };
+            let state = if ready {
+                Some("Deepgram ready".to_string())
+            } else {
+                Some("Deepgram not configured".to_string())
+            };
+            (ready, state, None)
+        }
+        TranscriptionProvider::WhisperLocal => {
+            let status = whisper::collect_manager_status(&config.transcription.whisper_local);
+            let model_installed = whisper::is_model_installed(
+                &config.transcription.whisper_local,
+                &config.transcription.whisper_local.model,
+            );
+            let ready = status.runtime.backend_ready() && model_installed;
+            let state = if ready {
+                Some(format!(
+                    "Whisper ready ({})",
+                    config.transcription.whisper_local.model
+                ))
+            } else if !status.runtime.backend_ready() {
+                Some("Whisper unavailable".to_string())
+            } else {
+                Some("Whisper model not installed".to_string())
+            };
+            let error = (!model_installed)
+                .then(|| {
+                    format!(
+                        "Whisper model {} is not installed.",
+                        config.transcription.whisper_local.model
+                    )
+                })
+                .or(status.runtime.detail.clone());
+            (ready, state, error)
+        }
+    }
+}
+
+fn selected_whisper_model(config: &AppConfig) -> Option<String> {
+    matches!(
+        config.transcription.provider,
+        TranscriptionProvider::WhisperLocal
+    )
+    .then(|| config.transcription.whisper_local.model.clone())
+}
+
+fn active_transcription_label(config: &AppConfig) -> String {
+    match &config.transcription.provider {
+        TranscriptionProvider::Deepgram => "Listening (cloud)".to_string(),
+        TranscriptionProvider::WhisperLocal => "Listening (local)".to_string(),
+    }
 }

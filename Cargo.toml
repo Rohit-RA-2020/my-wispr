@@ -23,6 +23,7 @@ futures-util = "0.3"
 gio = "0.22.2"
 glib = "0.22.3"
 gtk = { package = "gtk4", version = "0.11.1", features = ["v4_6"] }
+hound = "3.5.1"
 libadwaita = { version = "0.9.1", features = ["v1_6", "gtk_v4_6"] }
 gstreamer = "0.25.1"
 gstreamer-app = "0.25.0"
@@ -40,5 +41,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["v4", "serde"] }
+webrtc-vad = "0.4.0"
 zbus = { version = "5.14.0", features = ["tokio"] }
 zvariant = "5.8"
