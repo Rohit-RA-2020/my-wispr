@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dirs.workspace = true
@@ -24,3 +25,7 @@ uuid.workspace = true
 webrtc-vad.workspace = true
 zbus.workspace = true
 zvariant.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"

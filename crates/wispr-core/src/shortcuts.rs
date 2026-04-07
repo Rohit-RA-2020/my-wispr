@@ -71,37 +71,42 @@ fn resolve_semantic_command(
         .unwrap_or(ActiveAppClass::Generic);
 
     let repeat = action.repeat.max(1);
+    let primary = primary_modifier();
     let resolved = match command {
         SemanticCommandId::NewTab => shortcut(
             letter_key_for(target.clone(), ActionKey::T),
-            &[ModifierKey::Ctrl],
+            std::slice::from_ref(&primary),
             repeat,
         ),
         SemanticCommandId::CloseTab => shortcut(
             letter_key_for(target.clone(), ActionKey::W),
-            &[ModifierKey::Ctrl],
+            std::slice::from_ref(&primary),
             repeat,
         ),
-        SemanticCommandId::ReopenClosedTab => shortcut(
-            ActionKey::T,
-            &[ModifierKey::Ctrl, ModifierKey::Shift],
-            repeat,
-        ),
-        SemanticCommandId::Refresh => shortcut(ActionKey::R, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Find => shortcut(ActionKey::F, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Save => shortcut(ActionKey::S, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Copy => shortcut(ActionKey::C, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Paste => shortcut(ActionKey::V, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Cut => shortcut(ActionKey::X, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Undo => shortcut(ActionKey::Z, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::Redo => shortcut(
-            ActionKey::Z,
-            &[ModifierKey::Ctrl, ModifierKey::Shift],
-            repeat,
-        ),
-        SemanticCommandId::FocusAddressBar => shortcut(ActionKey::L, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::NextTab => shortcut(ActionKey::PageDown, &[ModifierKey::Ctrl], repeat),
-        SemanticCommandId::PreviousTab => shortcut(ActionKey::PageUp, &[ModifierKey::Ctrl], repeat),
+        SemanticCommandId::ReopenClosedTab => {
+            shortcut(ActionKey::T, &[primary.clone(), ModifierKey::Shift], repeat)
+        }
+        SemanticCommandId::Refresh => {
+            shortcut(ActionKey::R, std::slice::from_ref(&primary), repeat)
+        }
+        SemanticCommandId::Find => shortcut(ActionKey::F, std::slice::from_ref(&primary), repeat),
+        SemanticCommandId::Save => shortcut(ActionKey::S, std::slice::from_ref(&primary), repeat),
+        SemanticCommandId::Copy => shortcut(ActionKey::C, std::slice::from_ref(&primary), repeat),
+        SemanticCommandId::Paste => shortcut(ActionKey::V, std::slice::from_ref(&primary), repeat),
+        SemanticCommandId::Cut => shortcut(ActionKey::X, std::slice::from_ref(&primary), repeat),
+        SemanticCommandId::Undo => shortcut(ActionKey::Z, std::slice::from_ref(&primary), repeat),
+        SemanticCommandId::Redo => {
+            shortcut(ActionKey::Z, &[primary.clone(), ModifierKey::Shift], repeat)
+        }
+        SemanticCommandId::FocusAddressBar => {
+            shortcut(ActionKey::L, std::slice::from_ref(&primary), repeat)
+        }
+        SemanticCommandId::NextTab => {
+            shortcut(ActionKey::PageDown, std::slice::from_ref(&primary), repeat)
+        }
+        SemanticCommandId::PreviousTab => {
+            shortcut(ActionKey::PageUp, std::slice::from_ref(&primary), repeat)
+        }
     };
 
     Ok(vec![resolved])
@@ -170,7 +175,20 @@ fn builtin_denylist(profile: ShortcutDenylistProfile) -> Vec<String> {
         ShortcutDenylistProfile::Minimal => vec![
             normalize_combo_text("Ctrl+Alt+Delete"),
             normalize_combo_text("Super+L"),
+            normalize_combo_text("Super+Q"),
         ],
+    }
+}
+
+fn primary_modifier() -> ModifierKey {
+    #[cfg(target_os = "macos")]
+    {
+        ModifierKey::Super
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        ModifierKey::Ctrl
     }
 }
 

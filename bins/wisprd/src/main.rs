@@ -3,11 +3,14 @@ mod audio;
 mod deepgram;
 mod local_whisper;
 mod overlay;
+#[cfg(target_os = "linux")]
 mod portal;
 
 use std::{
     collections::HashSet,
+    fs,
     future::pending,
+    path::Path,
     process::Command,
     sync::{
         Arc,
@@ -15,16 +18,20 @@ use std::{
     },
 };
 
-use audio::{AudioCapture, resolve_selected_device};
+use audio::{AudioCapture, enumerate_devices, resolve_selected_device};
 use chrono::Utc;
 use deepgram::{DeepgramSession, TranscriptChunk, TranscriptEvent};
 use local_whisper::LocalWhisperSession;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
 use wispr_core::{
-    AppConfig, CorrectionScope, DecisionKind, FormattingTriggerPolicy, GenerationRequest,
-    LlmInterpreter, PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
+    AppConfig, CorrectionScope, DecisionKind, DictationCommand, DictationIpcRequest,
+    DictationIpcResponse, FormattingTriggerPolicy, GenerationRequest, LlmInterpreter,
+    PreferredListStyle, Result, RewriteScope, SegmentDecisionRequest, WisprError,
+    daemon_socket_path,
     models::{
         ActiveAppContext, DaemonStatus, DeviceChoice, DictationState, FormatKind,
         TranscriptionProvider,
@@ -34,6 +41,7 @@ use wispr_core::{
     typing::{UInputKeyboard, diff_patch},
     whisper,
 };
+#[cfg(target_os = "linux")]
 use zbus::connection::Builder as ConnectionBuilder;
 
 const DEEPGRAM_FRAME_BYTES: usize = 1_280;
@@ -93,44 +101,32 @@ struct StatusUpdate {
     generation_state: Option<Option<String>>,
 }
 
+#[cfg(target_os = "linux")]
 struct DictationDbus {
     state: Arc<AppState>,
 }
 
+#[cfg(target_os = "linux")]
 #[zbus::interface(name = "io.wispr.Dictation1")]
 impl DictationDbus {
     async fn toggle(&self) -> String {
-        match toggle_dictation(self.state.clone()).await {
-            Ok(message) => message,
-            Err(error) => error.to_string(),
-        }
+        handle_control_command(self.state.clone(), DictationCommand::Toggle).await
     }
 
     async fn start(&self) -> String {
-        match start_dictation(self.state.clone()).await {
-            Ok(message) => message,
-            Err(error) => error.to_string(),
-        }
+        handle_control_command(self.state.clone(), DictationCommand::Start).await
     }
 
     async fn stop(&self) -> String {
-        match stop_dictation(self.state.clone()).await {
-            Ok(message) => message,
-            Err(error) => error.to_string(),
-        }
+        handle_control_command(self.state.clone(), DictationCommand::Stop).await
     }
 
     async fn status(&self) -> String {
-        let status = self.state.status.read().await.clone();
-        serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string())
+        handle_control_command(self.state.clone(), DictationCommand::Status).await
     }
 
     async fn open_settings(&self) -> String {
-        let status = Command::new("wispr-settings").spawn();
-        match status {
-            Ok(_) => "Opened settings".to_string(),
-            Err(error) => format!("Failed to open settings: {error}"),
-        }
+        handle_control_command(self.state.clone(), DictationCommand::OpenSettings).await
     }
 }
 
@@ -175,6 +171,115 @@ impl TranscriptionBackend {
     }
 }
 
+async fn start_socket_server(state: Arc<AppState>) -> Result<()> {
+    let socket_path = daemon_socket_path()?;
+    prepare_socket_path(&socket_path)?;
+    let listener = UnixListener::bind(&socket_path)?;
+    info!("daemon socket listening at {}", socket_path.display());
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(value) => value,
+                Err(error) => {
+                    error!("daemon socket accept failed: {error}");
+                    continue;
+                }
+            };
+
+            let state_for_conn = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = handle_socket_connection(state_for_conn, stream).await {
+                    warn!("daemon socket request failed: {error}");
+                }
+            });
+        }
+    });
+
+    Ok(())
+}
+
+fn prepare_socket_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+async fn handle_socket_connection(state: Arc<AppState>, mut stream: UnixStream) -> Result<()> {
+    let mut request_bytes = Vec::new();
+    stream.read_to_end(&mut request_bytes).await?;
+    if request_bytes.is_empty() {
+        return Ok(());
+    }
+
+    let request: DictationIpcRequest = serde_json::from_slice(&request_bytes)?;
+    info!("received command: {:?}", request.command);
+    let response = match execute_control_command(state, request.command).await {
+        Ok(message) => {
+            info!("command succeeded: {message}");
+            DictationIpcResponse { ok: true, message }
+        }
+        Err(error) => {
+            error!("command failed: {error}");
+            DictationIpcResponse {
+                ok: false,
+                message: error.to_string(),
+            }
+        }
+    };
+
+    let payload = serde_json::to_vec(&response)?;
+    stream.write_all(&payload).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn handle_control_command(state: Arc<AppState>, command: DictationCommand) -> String {
+    match execute_control_command(state, command).await {
+        Ok(message) => message,
+        Err(error) => error.to_string(),
+    }
+}
+
+async fn execute_control_command(
+    state: Arc<AppState>,
+    command: DictationCommand,
+) -> Result<String> {
+    match command {
+        DictationCommand::Toggle => toggle_dictation(state).await,
+        DictationCommand::Start => start_dictation(state).await,
+        DictationCommand::Stop => stop_dictation(state).await,
+        DictationCommand::Status => {
+            let status = state.status.read().await.clone();
+            Ok(serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()))
+        }
+        DictationCommand::OpenSettings => open_settings_app(),
+    }
+}
+
+fn open_settings_app() -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return match Command::new("open").args(["-a", "Wispr"]).spawn() {
+            Ok(_) => Ok("Opened settings".to_string()),
+            Err(error) => Ok(format!("Failed to open settings: {error}")),
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        match Command::new("wispr-settings").spawn() {
+            Ok(_) => Ok("Opened settings".to_string()),
+            Err(error) => Ok(format!("Failed to open settings: {error}")),
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -193,42 +298,52 @@ async fn main() -> Result<()> {
         session: Mutex::new(None),
     });
 
-    let connection = ConnectionBuilder::session()?
-        .name(wispr_core::DICTATION_SERVICE)?
-        .serve_at(
-            wispr_core::DICTATION_OBJECT_PATH,
-            DictationDbus {
-                state: state.clone(),
-            },
-        )?
-        .build()
-        .await?;
+    start_socket_server(state.clone()).await?;
 
     sync_status(state.clone(), None, None).await?;
 
-    let hotkey = state.config.read().await.hotkey.clone();
-    match portal::register_toggle_shortcut(&connection, &hotkey).await {
-        Ok(mut events) => {
-            *state.hotkey_ready.write().await = true;
-            sync_status(state.clone(), None, None).await?;
-            let state_for_hotkey = state.clone();
-            tokio::spawn(async move {
-                while events.recv().await.is_some() {
-                    if let Err(error) = toggle_dictation(state_for_hotkey.clone()).await {
-                        error!("hotkey toggle failed: {error}");
-                    }
-                }
-            });
-        }
-        Err(error) => {
-            warn!("Portal hotkey registration failed: {error}");
-            sync_status(
-                state.clone(),
-                None,
-                Some("Portal shortcut binding failed. Use a GNOME custom shortcut that runs `wisprctl toggle`.".to_string()),
-            )
+    #[cfg(target_os = "linux")]
+    {
+        let connection = ConnectionBuilder::session()?
+            .name(wispr_core::DICTATION_SERVICE)?
+            .serve_at(
+                wispr_core::DICTATION_OBJECT_PATH,
+                DictationDbus {
+                    state: state.clone(),
+                },
+            )?
+            .build()
             .await?;
+
+        let hotkey = state.config.read().await.hotkey.clone();
+        match portal::register_toggle_shortcut(&connection, &hotkey).await {
+            Ok(mut events) => {
+                *state.hotkey_ready.write().await = true;
+                sync_status(state.clone(), None, None).await?;
+                let state_for_hotkey = state.clone();
+                tokio::spawn(async move {
+                    while events.recv().await.is_some() {
+                        if let Err(error) = toggle_dictation(state_for_hotkey.clone()).await {
+                            error!("hotkey toggle failed: {error}");
+                        }
+                    }
+                });
+            }
+            Err(error) => {
+                warn!("Portal hotkey registration failed: {error}");
+                sync_status(
+                    state.clone(),
+                    None,
+                    Some("Portal shortcut binding failed. Use a custom shortcut that runs `wisprctl toggle`.".to_string()),
+                )
+                .await?;
+            }
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        sync_status(state.clone(), None, None).await?;
     }
 
     info!("wisprd is running");
@@ -250,16 +365,22 @@ async fn start_dictation(state: Arc<AppState>) -> Result<String> {
     }
 
     let config = state.config.read().await.clone();
+    let available_devices = enumerate_devices()?;
+    if available_devices.is_empty() {
+        return Err(WisprError::InvalidState(
+            "No microphones were detected on this Mac. Confirm microphone access is granted and ffmpeg can enumerate AVFoundation devices.".to_string(),
+        ));
+    }
+
     let selected = resolve_selected_device(&config).ok_or_else(|| {
         WisprError::InvalidState(
-            "No valid microphone is selected. Open wispr-settings and choose a microphone."
-                .to_string(),
+            "The previously selected microphone is not available. Reconnect it or switch to an available microphone.".to_string(),
         )
     })?;
 
     let secret_store = SecretStore::connect().await?;
     let mut keyboard = wispr_core::typing::UInputKeyboard::open().map_err(|error| {
-        WisprError::InvalidState(format!("Typing engine failed to open /dev/uinput: {error}"))
+        WisprError::InvalidState(format!("Typing engine initialization failed: {error}"))
     })?;
 
     let llm_state = load_llm_interpreter(&config, &secret_store).await?;
@@ -1028,16 +1149,16 @@ async fn build_status(
             .unwrap_or(false),
         _ => false,
     };
+    let (accessibility_permission, input_monitoring_permission, microphone_permission) =
+        detect_platform_permissions();
     let generation_ready =
         !config.intelligence.enabled || !config.intelligence.generation_enabled || llm_ready;
+    let resolved_mic = resolve_selected_device(&config);
 
     DaemonStatus {
         state: state_override.unwrap_or(DictationState::Idle),
-        mic_ready: resolve_selected_device(&config).is_some(),
-        typing_ready: std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/uinput")
-            .is_ok(),
+        mic_ready: resolved_mic.is_some(),
+        typing_ready: typing_backend_ready(accessibility_permission),
         hotkey_ready: *state.hotkey_ready.read().await,
         transcription_provider,
         transcription_ready,
@@ -1046,7 +1167,7 @@ async fn build_status(
         last_transcription_error,
         intelligence_ready: !config.intelligence.enabled || llm_ready,
         llm_ready,
-        current_mic: config.selected_device.clone(),
+        current_mic: resolved_mic,
         partial_transcript: None,
         last_error: error,
         last_llm_error: None,
@@ -1074,7 +1195,52 @@ async fn build_status(
         } else {
             "Generation disabled".to_string()
         }),
+        accessibility_permission,
+        input_monitoring_permission,
+        microphone_permission,
         updated_at: Utc::now(),
+    }
+}
+
+fn typing_backend_ready(accessibility_permission: Option<bool>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        accessibility_permission.unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .is_ok()
+    }
+}
+
+fn detect_platform_permissions() -> (Option<bool>, Option<bool>, Option<bool>) {
+    #[cfg(target_os = "macos")]
+    {
+        let accessibility = Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"System Events\" to return UI elements enabled",
+            ])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if !output.status.success() {
+                    return None;
+                }
+                let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+                Some(value.contains("true"))
+            });
+
+        (accessibility, None, None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        (None, None, None)
     }
 }
 

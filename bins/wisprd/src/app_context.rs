@@ -1,8 +1,16 @@
-use serde::Deserialize;
 use wispr_core::models::{ActiveAppClass, ActiveAppContext};
-use zbus::Proxy;
 
+#[cfg(target_os = "linux")]
 pub async fn detect_active_app() -> Option<ActiveAppContext> {
+    use serde::Deserialize;
+    use zbus::Proxy;
+
+    #[derive(Deserialize)]
+    struct ShellWindowInfo {
+        #[serde(default)]
+        wm_class: String,
+    }
+
     let connection = zbus::Connection::session().await.ok()?;
     let proxy = Proxy::new(
         &connection,
@@ -38,10 +46,37 @@ pub async fn detect_active_app() -> Option<ActiveAppContext> {
     })
 }
 
-#[derive(Deserialize)]
-struct ShellWindowInfo {
-    #[serde(default)]
-    wm_class: String,
+#[cfg(target_os = "macos")]
+pub async fn detect_active_app() -> Option<ActiveAppContext> {
+    use tokio::process::Command;
+
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to get name of first application process whose frontmost is true",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let app_id = normalize_app_id(String::from_utf8_lossy(&output.stdout).trim());
+    if app_id.is_empty() {
+        return None;
+    }
+
+    Some(ActiveAppContext {
+        app_class: classify_app(&app_id),
+        app_id: Some(app_id),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub async fn detect_active_app() -> Option<ActiveAppContext> {
+    None
 }
 
 fn normalize_app_id(raw: &str) -> String {
@@ -71,6 +106,7 @@ fn matches_browser(app_id: &str) -> bool {
         "edge",
         "vivaldi",
         "zen",
+        "safari",
     ]
     .iter()
     .any(|candidate| app_id.contains(candidate))
@@ -86,6 +122,8 @@ fn matches_editor(app_id: &str) -> bool {
         "kate",
         "sublime",
         "jetbrains",
+        "xcode",
+        "textedit",
     ]
     .iter()
     .any(|candidate| app_id.contains(candidate))
@@ -101,6 +139,9 @@ fn matches_terminal(app_id: &str) -> bool {
         "xterm",
         "konsole",
         "tilix",
+        "terminal",
+        "iterm",
+        "warp",
     ]
     .iter()
     .any(|candidate| app_id.contains(candidate))

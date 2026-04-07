@@ -6,6 +6,7 @@ pub mod install;
 pub mod ipc;
 pub mod llm;
 pub mod models;
+pub mod platform;
 pub mod secrets;
 pub mod shortcuts;
 pub mod typing;
@@ -13,7 +14,10 @@ pub mod whisper;
 
 pub use config::AppConfig;
 pub use error::{Result, WisprError};
-pub use ipc::{DICTATION_INTERFACE, DICTATION_OBJECT_PATH, DICTATION_SERVICE, DictationProxy};
+pub use ipc::{
+    DICTATION_INTERFACE, DICTATION_OBJECT_PATH, DICTATION_SERVICE, DictationCommand,
+    DictationIpcRequest, DictationIpcResponse, DictationProxy, daemon_socket_path,
+};
 pub use llm::{InterpreterOutput, LlmInterpreter};
 pub use models::{
     ActionCommand, ActionKey, ActionScope, ActionType, ActiveAppClass, ActiveAppContext,

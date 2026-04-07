@@ -7,6 +7,7 @@ use crate::{
 
 const GROUP_NAME: &str = "wisprinput";
 const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/85-wispr-uinput.rules";
+const LAUNCH_AGENT_ID: &str = "io.wispr.wisprd";
 
 pub fn install_uinput_rule(current_user: &str) -> Result<String> {
     require_root()?;
@@ -54,23 +55,114 @@ pub fn install_uinput_rule(current_user: &str) -> Result<String> {
 }
 
 pub fn write_user_service(bin_dir: &Path) -> Result<String> {
-    let systemd_dir = dirs::config_dir()
-        .ok_or_else(|| {
-            WisprError::InvalidState("could not determine config directory".to_string())
-        })?
-        .join("systemd/user");
-    fs::create_dir_all(&systemd_dir)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bin_dir;
+        return Err(WisprError::InvalidState(
+            "systemd user service is only available on Linux".to_string(),
+        ));
+    }
 
-    let service_body = format!(
-        "[Unit]\nDescription=Wispr Dictation Daemon\nAfter=graphical-session.target\n\n[Service]\nType=simple\nExecStart={}/wisprd\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-        bin_dir.display()
+    #[cfg(target_os = "linux")]
+    {
+        let systemd_dir = dirs::config_dir()
+            .ok_or_else(|| {
+                WisprError::InvalidState("could not determine config directory".to_string())
+            })?
+            .join("systemd/user");
+        fs::create_dir_all(&systemd_dir)?;
+
+        let service_body = format!(
+            "[Unit]\nDescription=Wispr Dictation Daemon\nAfter=graphical-session.target\n\n[Service]\nType=simple\nExecStart={}/wisprd\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+            bin_dir.display()
+        );
+        let path = systemd_dir.join("wisprd.service");
+        fs::write(&path, service_body)?;
+        Ok(format!(
+            "Wrote {}. Run `systemctl --user daemon-reload && systemctl --user enable --now wisprd.service`.",
+            path.display()
+        ))
+    }
+}
+
+pub fn write_launch_agent(bin_dir: &Path) -> Result<String> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        WisprError::InvalidState("could not determine home directory".to_string())
+    })?;
+    let launch_agents_dir = home.join("Library/LaunchAgents");
+    fs::create_dir_all(&launch_agents_dir)?;
+
+    let plist_path = launch_agents_dir.join(format!("{LAUNCH_AGENT_ID}.plist"));
+    let plist_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCH_AGENT_ID}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        bin_dir.join("wisprd").display()
     );
-    let path = systemd_dir.join("wisprd.service");
-    fs::write(&path, service_body)?;
+    fs::write(&plist_path, plist_body)?;
+
+    let _ = Command::new("launchctl")
+        .args(["unload", plist_path.to_string_lossy().as_ref()])
+        .status();
+    let load_status = Command::new("launchctl")
+        .args(["load", plist_path.to_string_lossy().as_ref()])
+        .status()?;
+    ensure_success(load_status, "launchctl load")?;
+
     Ok(format!(
-        "Wrote {}. Run `systemctl --user daemon-reload && systemctl --user enable --now wisprd.service`.",
-        path.display()
+        "Installed and loaded {}.",
+        plist_path.display()
     ))
+}
+
+pub fn remove_launch_agent() -> Result<String> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        WisprError::InvalidState("could not determine home directory".to_string())
+    })?;
+    let plist_path = home
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCH_AGENT_ID}.plist"));
+
+    if plist_path.exists() {
+        let _ = Command::new("launchctl")
+            .args(["unload", plist_path.to_string_lossy().as_ref()])
+            .status();
+        fs::remove_file(&plist_path)?;
+        return Ok(format!("Removed {}.", plist_path.display()));
+    }
+
+    Ok(format!("No launch agent was installed at {}.", plist_path.display()))
+}
+
+pub fn write_autostart(bin_dir: &Path) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        write_launch_agent(bin_dir)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        write_user_service(bin_dir)
+    }
 }
 
 pub fn write_default_config() -> Result<String> {
@@ -80,7 +172,10 @@ pub fn write_default_config() -> Result<String> {
         Result::<AppConfig>::Ok(config)
     })?;
     config.save()?;
-    Ok("Wrote default config under ~/.config/wispr/config.toml".to_string())
+    Ok(format!(
+        "Wrote default config under {}.",
+        AppConfig::config_path()?.display()
+    ))
 }
 
 fn require_root() -> Result<()> {

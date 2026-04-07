@@ -2,67 +2,90 @@
 
 # Wispr
 
-Wispr is a native Ubuntu GNOME dictation tool for Wayland. It runs as a background daemon, captures audio from a selected microphone, transcribes speech either through Deepgram or a local Whisper backend, and types into the currently focused application through a virtual keyboard. Finalized spoken segments can also be interpreted by a configurable OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, formatted text, or autonomous generated writing instead of literal text.
+Wispr is a desktop dictation tool with first-class support for both Linux and macOS.
+It runs a background Rust daemon, captures microphone audio, transcribes speech through either Deepgram or local Whisper, and types into the focused application. Finalized transcript segments can also be interpreted by an OpenAI-compatible LLM so spoken commands become editing actions, semantic shortcuts, formatted text, or autonomous generated writing instead of literal text.
 
-This repository currently targets Ubuntu GNOME on Wayland.
+This repository now supports two primary desktop targets:
 
-## Current Behavior
+- Linux: GTK settings app, systemd user service, `/dev/uinput` typing, PipeWire capture
+- macOS: SwiftUI menu bar app, LaunchAgent autostart, Apple automation typing, AVFoundation capture through `ffmpeg`
 
-- `wisprd` runs as a user service and exposes a D-Bus control API
-- `wispr-settings` is the GTK4/libadwaita settings window
-- `wisprctl` is the CLI for setup and daemon control
-- microphone selection is stored in `~/.config/wispr/config.toml`
-- the Deepgram API key and LLM API key are stored in GNOME Secret Service, not in the config file
-- direct typing uses `/dev/uinput`
-- live capture currently uses `pw-record` for the audio stream and GStreamer only for device enumeration
-- transcription can run either through Deepgram streaming or through local Whisper turn-by-turn transcription
-- local Whisper is English-only in v1, does not emit live partials, and manages models under `~/.local/share/wispr/whisper`
-- finalized transcript segments can be passed through an OpenAI-compatible `responses` backend for structured command interpretation
-- the LLM layer supports literal dictation, editing actions, semantic commands, block formatting, autonomous writing mode, and literal text plus actions in the same spoken segment
+## Platform Summary
 
-## Capabilities
+| Area | Linux | macOS |
+| --- | --- | --- |
+| Main control surface | `wispr-settings` GTK app + `wisprctl` | `Wispr.app` menu bar app + `wisprctl` |
+| Background service | `wisprd` | `wisprd` |
+| IPC | Unix socket JSON API | Unix socket JSON API |
+| Config path | `~/.config/wispr/config.toml` | `~/Library/Application Support/wispr/config.toml` |
+| Socket path | `~/.config/wispr/wisprd.sock` | `~/Library/Application Support/wispr/wisprd.sock` |
+| Secret storage | GNOME Secret Service | macOS Keychain |
+| Autostart | `systemd --user` | LaunchAgent |
+| Audio capture | PipeWire / `pw-record` | `ffmpeg -f avfoundation` |
+| Typing backend | `/dev/uinput` | `osascript` / System Events |
+| Native UI | GTK4/libadwaita | SwiftUI menu bar app |
+
+## Current Capabilities
+
+Shared capabilities across both platforms:
 
 - live dictation into the focused app
-- configurable microphone selection with persistent device choice
-- Deepgram speech-to-text streaming
-- local Whisper speech-to-text with selectable model, download/delete controls, and no cloud dependency after model download
-- OpenAI-compatible command interpretation with configurable base URL, model, and API key
-- spoken editing commands such as `hello enter`, `select all`, `copy`, `paste`, `undo`, and `redo`
-- dynamic spoken shortcuts such as `press control t`, `press control shift p`, `press alt tab`, and `press super left`
-- semantic spoken commands such as `open a new browser tab`, `close this tab`, `focus the address bar`, `save file`, and `refresh this page`
-- GNOME-aware app context detection so semantic commands can resolve differently in browsers versus generic apps
-- repeated key actions such as `press space key twice`
-- function key actions such as `press the F5 key`
-- shell-style text cleanup for command dictation, for example `flutter dash dash version enter` becoming `flutter --version` followed by `Enter`
-- intelligent list formatting and block rewrites for structured dictation such as to-do lists with spoken corrections
-- autonomous writing mode for explicit prompts such as `write an essay on world war two` or `draft an email for leave`
-- streamed long-form generation directly into the focused text field, with stop keeping partial output
+- Deepgram streaming speech-to-text
+- local Whisper speech-to-text with downloadable models
+- OpenAI-compatible command interpretation with configurable base URL and model
+- spoken editing commands such as `hello enter`, `copy`, `paste`, `undo`, and `redo`
+- dynamic spoken shortcuts such as `press control t` and `press control shift p`
+- semantic commands such as `open a new browser tab`, `save file`, and `refresh this page`
+- structured text formatting for lists and rewritten blocks
+- autonomous writing mode for explicit generation requests
+- CLI control through `wisprctl`
+
+Platform-specific behavior:
+
+- Linux uses GNOME-aware active-app detection and a GTK settings window.
+- macOS uses a SwiftUI menu bar app, a built-in global shortcut, and system privacy panes for permissions.
 
 ## Workspace Layout
 
-- `crates/wispr-core`: shared config, models, D-Bus interface, secret storage, typing diffing, and install helpers
-- `bins/wisprd`: background daemon, Deepgram and Whisper transcription backends, audio capture, overlay, and shortcut handling
-- `bins/wispr-settings`: GTK4/libadwaita settings window
-- `bins/wisprctl`: CLI for daemon control, autostart install, default config generation, and `/dev/uinput` setup
-- `assets/systemd/wisprd.service`: user service template
-- `assets/desktop/wispr-settings.desktop`: desktop launcher
-- `scripts/setup-uinput.sh`: helper script for `/dev/uinput` permission setup
+- `crates/wispr-core`: shared config, models, IPC client, secret storage, typing diffing, shortcuts, install helpers
+- `bins/wisprd`: background daemon, transcription backends, audio capture, overlay, status handling
+- `bins/wisprctl`: CLI for daemon control, setup, config updates, diagnostics, and install helpers
+- `bins/wispr-settings`: Linux GTK settings app
+- `apps/WisprMac`: macOS SwiftUI menu bar app
+- `scripts/install_wispr_mac_dev.sh`: local macOS app bundle installer for development
+- `assets/systemd/wisprd.service`: Linux user-service template
+- `assets/desktop/wispr-settings.desktop`: Linux desktop launcher
 
 ## Runtime Requirements
 
-Wispr expects these tools or services to exist at runtime:
+Common:
+
+- Rust toolchain
+- a Deepgram API key for cloud transcription
+- `python3` and `ffmpeg` for local Whisper transcription
+- an OpenAI-compatible API key if intelligence is enabled
+
+Linux:
 
 - PipeWire with `pw-record`
 - GNOME Secret Service
 - `systemd --user`
 - `/dev/uinput`
-- a Deepgram API key for cloud transcription
-- `python3`, `python3-venv`, and `ffmpeg` for local transcription
-- an OpenAI-compatible LLM API key if intelligence is enabled
+- GTK4/libadwaita runtime for `wispr-settings`
+
+macOS:
+
+- macOS 13+
+- `ffmpeg` available at runtime, typically from Homebrew
+- Accessibility permission for text injection
+- Microphone permission for audio capture
+- Input Monitoring may be needed depending on your automation/security settings
 
 ## Build Dependencies
 
-Install the native packages Wispr needs on Ubuntu:
+### Linux
+
+Install the native packages Wispr needs on Ubuntu or another Debian-based distro:
 
 ```bash
 sudo apt-get install -y \
@@ -72,31 +95,43 @@ sudo apt-get install -y \
   libpipewire-0.3-dev
 ```
 
-For local Whisper transcription, Wispr uses a dedicated virtual environment at
-`~/.local/share/wispr/whisper-venv`. You can create it from the settings UI with
-the `Install Whisper` button, or prepare it manually:
+### macOS
+
+Install the core dependencies:
 
 ```bash
-python3 -m venv ~/.local/share/wispr/whisper-venv
-~/.local/share/wispr/whisper-venv/bin/pip install -U pip wheel
-~/.local/share/wispr/whisper-venv/bin/pip install -U openai-whisper
+brew install ffmpeg
 ```
+
+You also need:
+
+- Rust toolchain
+- Xcode Command Line Tools / Swift 5.9+ to build `apps/WisprMac`
 
 ## Build
 
-Build the workspace:
+Build the Rust workspace:
 
 ```bash
 cargo build
 ```
 
-The main binaries will be:
+Main binaries:
 
 - `target/debug/wisprd`
 - `target/debug/wisprctl`
-- `target/debug/wispr-settings`
+- `target/debug/wispr-settings` on Linux
+
+Build the macOS app shell:
+
+```bash
+cd apps/WisprMac
+swift build
+```
 
 ## Installation
+
+### Linux Installation
 
 1. Write the default config:
 
@@ -104,7 +139,7 @@ The main binaries will be:
 cargo run --bin wisprctl -- write-default-config
 ```
 
-2. Install the binaries into `~/.local/bin`:
+2. Install binaries:
 
 ```bash
 mkdir -p ~/.local/bin
@@ -142,19 +177,133 @@ sudo ~/.local/bin/wisprctl setup-uinput
 ~/.local/bin/wispr-settings
 ```
 
-Then:
+### macOS Installation
 
-- choose `Cloud (Deepgram)` or `Local (Whisper)` as the transcription backend
-- store your Deepgram API key if you use cloud transcription
-- install/download a Whisper model if you use local transcription
-- optionally enable Intelligence and store your LLM API key
-- set the LLM base URL and model if you are not using the default OpenAI endpoint
-- select the microphone you want to use
-- save your settings
+For local development, install the bundled app with:
+
+```bash
+./scripts/install_wispr_mac_dev.sh
+```
+
+That script builds:
+
+- `wisprd`
+- `wisprctl`
+- `WisprMacApp`
+
+and installs a local app bundle at:
+
+- `~/Applications/Wispr.app`
+
+Then open it:
+
+```bash
+open ~/Applications/Wispr.app
+```
+
+The app bundle contains:
+
+- `WisprMacApp`
+- `wisprd`
+- `wisprctl`
+
+## First-Time Setup
+
+### Linux
+
+Open `wispr-settings` and configure:
+
+- transcription provider: `Cloud (Deepgram)` or `Local (Whisper)`
+- Deepgram API key if using cloud transcription
+- Whisper runtime and model if using local transcription
+- LLM API key, base URL, and model if intelligence is enabled
+- microphone selection
+
+### macOS
+
+Open `Wispr.app`, then use the Settings window to configure:
+
+- transcription provider: `Cloud (Deepgram)` or `Local (Whisper)`
+- Deepgram API key
+- LLM API key
+- LLM base URL and model
+- Whisper runtime install, model download, and model test
+- daemon start/stop and LaunchAgent install
+- system permission shortcuts
+
+Current macOS default global shortcut:
+
+- `Control + Option + Space`
+
+Current macOS limitation:
+
+- there is not yet a native microphone picker in the Settings window; the daemon resolves the configured or first available device automatically
+
+## Config and Data Locations
+
+### Linux
+
+- config: `~/.config/wispr/config.toml`
+- daemon socket: `~/.config/wispr/wisprd.sock`
+- local Whisper data: `~/.local/share/wispr/whisper`
+- Whisper virtualenv: `~/.local/share/wispr/whisper-venv`
+
+### macOS
+
+- config: `~/Library/Application Support/wispr/config.toml`
+- daemon socket: `~/Library/Application Support/wispr/wisprd.sock`
+- local Whisper data: `~/Library/Application Support/Wispr/whisper`
+- Whisper virtualenv: `~/Library/Application Support/Wispr/whisper-venv`
+- local daemon log from `Wispr.app`: `~/.wispr/logs/wisprd.log`
+- LaunchAgent plist: `~/Library/LaunchAgents/io.wispr.wisprd.plist`
+
+## Day-To-Day Use
+
+Common CLI commands:
+
+```bash
+wisprctl toggle
+wisprctl start
+wisprctl stop
+wisprctl status
+wisprctl doctor
+wisprctl open-settings
+wisprctl show-config
+```
+
+Configuration commands:
+
+```bash
+wisprctl set-deepgram-key "<DEEPGRAM_KEY>"
+wisprctl set-llm-key "<LLM_KEY>"
+wisprctl set-llm-base-url "https://api.openai.com/v1"
+wisprctl set-llm-model "gpt-4o-mini"
+wisprctl set-provider deepgram      # or: whisper_local
+wisprctl set-whisper-model base.en
+wisprctl whisper-status
+wisprctl install-whisper-runtime
+wisprctl download-whisper-model base.en
+wisprctl delete-whisper-model base.en
+wisprctl test-whisper-model base.en
+```
+
+LLM interpreter test commands:
+
+```bash
+wisprctl test-llm "hello enter"
+wisprctl test-llm "press control t"
+wisprctl test-llm --app-class browser "open a new browser tab"
+wisprctl test-llm "write an essay on world war two"
+```
+
+Platform-specific usage:
+
+- Linux: use the GTK settings app and your Linux autostart/service setup.
+- macOS: use the menu bar app for regular control and settings.
 
 ## Intelligence Configuration
 
-Wispr can interpret finalized speech through a configurable OpenAI-compatible `responses` API backend. These fields live under `[intelligence]` in `~/.config/wispr/config.toml`:
+These fields live under `[intelligence]` in the config file:
 
 ```toml
 [intelligence]
@@ -179,53 +328,28 @@ shortcut_allowlist = []
 shortcut_denylist = []
 ```
 
-`timeout_ms` is the short command-interpretation budget. `generation_timeout_ms` is a much longer safety ceiling for autonomous writing streams, so essays and emails can finish naturally instead of being cut off after a couple seconds.
+`timeout_ms` is the short command-interpretation budget. `generation_timeout_ms` is the longer ceiling for autonomous writing streams.
 
-The LLM API key is stored separately in GNOME Secret Service. The settings UI includes a `Test LLM` button plus controls for dynamic shortcuts, semantic commands, autonomous writing, denylist profile, timeouts, and optional allowlist or denylist overrides. The CLI also exposes direct interpreter test commands.
+## Intelligent Command Examples
 
-## Day-To-Day Use
+Examples of phrases Wispr can interpret:
 
-Start or stop dictation with:
+- `hello enter`
+- `select all`
+- `press control t`
+- `press control shift p`
+- `press alt tab`
+- `press super left`
+- `press space key twice`
+- `press the F5 key`
+- `flutter dash dash version enter`
+- `open a new browser tab`
+- `close this tab`
+- `reopen the last closed tab`
+- `focus the address bar`
+- `save file`
 
-```bash
-~/.local/bin/wisprctl toggle
-```
-
-Other useful commands:
-
-```bash
-~/.local/bin/wisprctl start
-~/.local/bin/wisprctl stop
-~/.local/bin/wisprctl status
-~/.local/bin/wisprctl open-settings
-~/.local/bin/wisprctl test-llm "hello enter"
-~/.local/bin/wisprctl test-llm "press control t"
-~/.local/bin/wisprctl test-llm --app-class browser "open a new browser tab"
-~/.local/bin/wisprctl test-llm "write an essay on world war two"
-```
-
-## Intelligent Commands
-
-Examples of phrases that Wispr can now interpret:
-
-- `hello enter` -> types `hello` and presses `Enter`
-- `select all` -> sends `Ctrl+A`
-- `press control t` -> sends `Ctrl+T`
-- `press control shift p` -> sends `Ctrl+Shift+P`
-- `press alt tab` -> sends `Alt+Tab`
-- `press super left` -> sends `Super+Left`
-- `press space key twice` -> presses `Space` twice
-- `press the F5 key` -> presses `F5`
-- `flutter dash dash version enter` -> types `flutter --version` and presses `Enter`
-- `open a new browser tab` -> resolves to `Ctrl+T` in browser context
-- `close this tab` -> resolves to `Ctrl+W`
-- `reopen the last closed tab` -> resolves to `Ctrl+Shift+T`
-- `focus the address bar` -> resolves to `Ctrl+L`
-- `save file` -> resolves to `Ctrl+S`
-
-## Autonomous Writing
-
-Wispr can detect explicit writing requests and switch into autonomous writing mode.
+## Autonomous Writing Examples
 
 Examples:
 
@@ -235,136 +359,39 @@ Examples:
 
 Behavior:
 
-- the spoken request is removed from the text field once generation starts
-- generated text is streamed directly into the focused field as it arrives
-- generation stops when the model finishes, when you stop Wispr manually, or when the backend ends the stream
-- if you stop mid-generation, partial generated output stays in the field
-- autonomous writing uses a separate long `generation_timeout_ms` safety ceiling instead of the short command timeout
+- the spoken request is removed from the field once generation starts
+- generated text is streamed into the focused field
+- stopping dictation stops generation
+- partial generated output remains in the field if stopped mid-stream
 
-## Intelligent Formatting
+## Current Limitations
 
-Wispr can also rewrite the current dictation block when the spoken structure is clear.
+Linux:
 
-Examples:
+- Linux-first integrations still assume GNOME/Wayland and `/dev/uinput`
+- `wispr-settings` is Linux-only
 
-- ordered list speech can become a numbered list automatically
-- spoken corrections like `wait, not housecleaning, washing of clothes instead` can rewrite only the current list block
-- plain prose stays literal when structure is not clear
+macOS:
 
-Formatted block rewrites are applied back into the focused editor through the same typing layer used for normal dictation.
-
-The LLM layer is constrained to text formatting plus keyboard-driven actions only. It does not launch apps, run shell commands itself, click the mouse, or perform arbitrary desktop automation. Semantic commands are resolved into keyboard shortcuts, not direct system calls.
-
-## Hotkey Behavior
-
-Wispr first tries to register a Wayland global shortcut through the XDG desktop portal.
-
-On some GNOME sessions that portal registration fails with `org.freedesktop.DBus.Error.NoReply`. In that case, Wispr falls back to a GNOME custom shortcut instead of failing completely.
-
-The fallback shortcut used in this setup is:
-
-- `Windows + Shift + D`
-
-That GNOME shortcut runs:
-
-```bash
-~/.local/bin/wisprctl toggle
-```
-
-If you want to inspect the configured fallback shortcut:
-
-```bash
-gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings
-gsettings get org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ binding
-gsettings get org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/ command
-```
-
-## Files and State
-
-- config: `~/.config/wispr/config.toml`
-- user service: `~/.config/systemd/user/wisprd.service`
-- desktop entry: `~/.local/share/applications/wispr-settings.desktop`
-- binaries: `~/.local/bin/wisprd`, `~/.local/bin/wisprctl`, `~/.local/bin/wispr-settings`
+- secure text fields such as password boxes are OS-protected and cannot be typed into
+- typing currently goes through AppleScript / System Events, so responsiveness is still behind the Linux virtual-keyboard path
+- the native Settings window does not yet expose a microphone picker
+- local Whisper still depends on Python + `openai-whisper`, not `whisper.cpp`
 
 ## Troubleshooting
 
-### Daemon status
+### Linux
 
-Check the daemon:
+- check daemon status with `wisprctl doctor` and `wisprctl status`
+- verify `systemctl --user status wisprd.service`
+- if typing fails, confirm `/dev/uinput` permissions and that your user is in `wisprinput`
+- if secrets fail, confirm GNOME Secret Service is running
 
-```bash
-~/.local/bin/wisprctl status
-~/.local/bin/wisprctl test-llm "hello enter"
-systemctl --user status wisprd.service --no-pager
-journalctl --user -u wisprd.service -n 50 --no-pager
-```
+### macOS
 
-The daemon status now includes LLM-related fields such as `intelligence_ready`, `llm_ready`, `last_llm_error`, `last_decision_kind`, `intelligence_state`, `generation_ready`, `generation_active`, `last_generation_error`, and may also show the detected active app plus the last resolved shortcut description.
-
-### No typing
-
-Make sure `/dev/uinput` is usable:
-
-```bash
-ls -l /dev/uinput
-id
-```
-
-Your user should be in the `wisprinput` group after running `setup-uinput` and logging out and back in.
-
-### Microphone debugging
-
-Record from a specific PipeWire source:
-
-```bash
-pw-record --target alsa_input.usb-046d_C270_HD_WEBCAM_4F74BC60-02.mono-fallback --rate 16000 --channels 1 --format s16 /tmp/wispr-webcam.wav
-pw-play /tmp/wispr-webcam.wav
-```
-
-### Hotkey not firing
-
-If the portal shortcut path fails, confirm the GNOME fallback shortcut exists:
-
-```bash
-gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings
-```
-
-If needed, verify the fallback command executes:
-
-```bash
-~/.local/bin/wisprctl toggle
-```
-
-### LLM fallback or literal-only behavior
-
-If Wispr keeps typing literal text for commands, check:
-
-```bash
-~/.local/bin/wisprctl status
-~/.local/bin/wisprctl test-llm "select all"
-~/.local/bin/wisprctl test-llm "press control t"
-~/.local/bin/wisprctl test-llm --app-class browser "open a new browser tab"
-~/.local/bin/wisprctl test-llm "draft an email for leave"
-journalctl --user -u wisprd.service -n 50 --no-pager
-```
-
-Common causes:
-
-- no LLM API key stored in Secret Service
-- incorrect LLM base URL or model
-- backend compatibility issues with the OpenAI-compatible `responses` API
-- a backend that rejects strict JSON schema output
-- a shortcut blocked by the built-in safety policy or your configured denylist
-- missing or wrong app context for a semantic command that depends on browser-style mappings
-- generation timeout set too low for the amount of text you asked it to write
-
-## Notes
-
-- the current Deepgram client uses the streaming listen endpoint and `nova-3`
-- the current capture path uses `pw-record` because it behaved more reliably on this machine than the earlier GStreamer live capture path
-- the LLM interpreter prefers streaming `responses` but falls back to a non-streaming `responses` request when a compatible backend closes the stream noisily
-- the daemon can press dynamic modifier combinations with `Ctrl`, `Shift`, `Alt`, and `Super`
-- semantic commands currently cover common high-value app actions such as tab control, reload, find, save, copy, paste, undo, redo, and address-bar focus
-- autonomous writing currently triggers only for explicit writing requests, not broad generative inference
-- autonomous writing reuses the same configured LLM backend, model, and API key as the command interpreter, but uses a separate long generation timeout
-- a minimal built-in safety policy blocks clearly dangerous shortcuts such as `Ctrl+Alt+Delete` and `Super+L`
+- use the installed app at `~/Applications/Wispr.app`, not just `swift run`
+- if dictation does not start, check `wisprctl doctor`
+- if the app starts but audio does not begin, inspect `~/.wispr/logs/wisprd.log`
+- if microphone access was granted to Terminal but not `Wispr`, reinstall the app and launch the bundle directly
+- if you installed an older LaunchAgent, remove and reinstall it from the app Settings window
+- if `ffmpeg` came from Homebrew, make sure it exists at `/opt/homebrew/bin/ffmpeg` or `/usr/local/bin/ffmpeg`

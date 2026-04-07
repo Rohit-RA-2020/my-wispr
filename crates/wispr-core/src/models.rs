@@ -504,6 +504,9 @@ pub struct DaemonStatus {
     pub generation_ready: bool,
     pub last_generation_error: Option<String>,
     pub generation_state: Option<String>,
+    pub accessibility_permission: Option<bool>,
+    pub input_monitoring_permission: Option<bool>,
+    pub microphone_permission: Option<bool>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -533,6 +536,9 @@ impl Default for DaemonStatus {
             generation_ready: false,
             last_generation_error: None,
             generation_state: None,
+            accessibility_permission: None,
+            input_monitoring_permission: None,
+            microphone_permission: None,
             updated_at: Utc::now(),
         }
     }

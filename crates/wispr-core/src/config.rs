@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -116,11 +117,42 @@ impl Default for TranscriptionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct MacOsPlatformConfig {
+    pub launch_at_login: bool,
+    pub permissions_last_checked_at: Option<DateTime<Utc>>,
+}
+
+impl Default for MacOsPlatformConfig {
+    fn default() -> Self {
+        Self {
+            launch_at_login: false,
+            permissions_last_checked_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlatformConfig {
+    pub macos: MacOsPlatformConfig,
+}
+
+impl Default for PlatformConfig {
+    fn default() -> Self {
+        Self {
+            macos: MacOsPlatformConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub overlay: OverlayConfig,
     pub typing: TypingConfig,
     pub transcription: TranscriptionConfig,
     pub intelligence: IntelligenceConfig,
+    pub platform: PlatformConfig,
     pub autostart: bool,
     pub selected_device: Option<DeviceChoice>,
     pub hotkey: HotkeyBinding,
@@ -133,6 +165,7 @@ impl Default for AppConfig {
             typing: TypingConfig::default(),
             transcription: TranscriptionConfig::default(),
             intelligence: IntelligenceConfig::default(),
+            platform: PlatformConfig::default(),
             autostart: true,
             selected_device: None,
             hotkey: HotkeyBinding::default(),
@@ -142,10 +175,21 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn config_dir() -> Result<PathBuf> {
-        let base = dirs::config_dir().ok_or_else(|| {
-            WisprError::InvalidState("could not determine XDG config directory".to_string())
-        })?;
-        Ok(base.join("wispr"))
+        #[cfg(target_os = "macos")]
+        {
+            let home = dirs::home_dir().ok_or_else(|| {
+                WisprError::InvalidState("could not determine home directory".to_string())
+            })?;
+            return Ok(home.join("Library/Application Support/wispr"));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let base = dirs::config_dir().ok_or_else(|| {
+                WisprError::InvalidState("could not determine XDG config directory".to_string())
+            })?;
+            Ok(base.join("wispr"))
+        }
     }
 
     pub fn config_path() -> Result<PathBuf> {
@@ -200,6 +244,8 @@ mod tests {
             TranscriptionProvider::WhisperLocal
         );
         assert_eq!(parsed.transcription.whisper_local.model, "small.en");
+        assert!(!parsed.platform.macos.launch_at_login);
+        assert!(parsed.platform.macos.permissions_last_checked_at.is_none());
         assert!(
             !parsed
                 .transcription

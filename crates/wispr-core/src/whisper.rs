@@ -45,24 +45,31 @@ struct WhisperJsonOutput {
 }
 
 pub fn default_model_dir() -> PathBuf {
-    let base = dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"));
-    base.join("wispr/whisper")
+    whisper_data_root().join("whisper")
 }
 
 pub fn default_venv_dir() -> PathBuf {
-    let base = dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"));
-    base.join("wispr/whisper-venv")
+    whisper_data_root().join("whisper-venv")
 }
 
 fn bootstrap_dir() -> PathBuf {
+    whisper_data_root().join("bootstrap")
+}
+
+fn whisper_data_root() -> PathBuf {
     let base = dirs::data_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
         .unwrap_or_else(|| PathBuf::from(".local/share"));
-    base.join("wispr/bootstrap")
+
+    #[cfg(target_os = "macos")]
+    {
+        base.join("Wispr")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        base.join("wispr")
+    }
 }
 
 fn virtualenv_bootstrap_path() -> PathBuf {
