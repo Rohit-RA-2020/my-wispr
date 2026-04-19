@@ -639,15 +639,16 @@ async fn process_finalized_segment(
                             },
                         )
                         .await;
-                        let next_rendered = render_literal_fallback(
+                        apply_literal_fallback(
+                            state,
+                            keyboard,
                             committed_prefix,
-                            active_block.as_ref(),
+                            active_block,
+                            active_turn,
+                            &previous_rendered,
                             &chunk.text,
-                        );
-                        apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
-                        *committed_prefix = next_rendered;
-                        *active_block = None;
-                        active_turn.clear();
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -669,6 +670,10 @@ async fn process_finalized_segment(
                         &output.decision.format_kind,
                     ),
                 };
+                copy_final_literal_transcript(
+                    state,
+                    clipboard_text_for_decision(&output.decision).as_deref(),
+                );
                 apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
                 let closes_block =
                     !resolved_actions.actions.is_empty() || !output.decision.keep_block_open;
@@ -756,12 +761,16 @@ async fn process_finalized_segment(
         }
     }
 
-    let next_rendered =
-        render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
-    apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
-    *committed_prefix = next_rendered;
-    *active_block = None;
-    active_turn.clear();
+    apply_literal_fallback(
+        state,
+        keyboard,
+        committed_prefix,
+        active_block,
+        active_turn,
+        &previous_rendered,
+        &chunk.text,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -780,12 +789,16 @@ async fn process_generation_segment(
     chunk: TranscriptChunk,
 ) {
     if !config.intelligence.generation_enabled {
-        let next_rendered =
-            render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
-        apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
-        *committed_prefix = next_rendered;
-        *active_block = None;
-        active_turn.clear();
+        apply_literal_fallback(
+            state,
+            keyboard,
+            committed_prefix,
+            active_block,
+            active_turn,
+            &previous_rendered,
+            &chunk.text,
+        )
+        .await;
         return;
     }
 
@@ -793,12 +806,16 @@ async fn process_generation_segment(
         Some(prompt) if !prompt.trim().is_empty() => prompt,
         _ => {
             warn!("generation decision is missing generation_prompt");
-            let next_rendered =
-                render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
-            apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
-            *committed_prefix = next_rendered;
-            *active_block = None;
-            active_turn.clear();
+            apply_literal_fallback(
+                state,
+                keyboard,
+                committed_prefix,
+                active_block,
+                active_turn,
+                &previous_rendered,
+                &chunk.text,
+            )
+            .await;
             return;
         }
     };
@@ -853,15 +870,16 @@ async fn process_generation_segment(
             Err(error) => {
                 warn!("generation failed: {error}");
                 if generated_text.is_empty() {
-                    let next_rendered = render_literal_fallback(
+                    apply_literal_fallback(
+                        state,
+                        keyboard,
                         committed_prefix,
-                        active_block.as_ref(),
+                        active_block,
+                        active_turn,
+                        &current_rendered,
                         &chunk.text,
-                    );
-                    apply_transcript(state, keyboard, &current_rendered, &next_rendered).await;
-                    *committed_prefix = next_rendered;
-                    *active_block = None;
-                    active_turn.clear();
+                    )
+                    .await;
                     publish_status(
                         state,
                         StatusUpdate {
@@ -897,15 +915,21 @@ async fn process_generation_segment(
 
     if cancel_flag.load(Ordering::Relaxed) {
         if generated_text.is_empty() {
-            let next_rendered =
-                render_literal_fallback(committed_prefix, active_block.as_ref(), &chunk.text);
-            apply_transcript(state, keyboard, &current_rendered, &next_rendered).await;
-            *committed_prefix = next_rendered;
+            apply_literal_fallback(
+                state,
+                keyboard,
+                committed_prefix,
+                active_block,
+                active_turn,
+                &current_rendered,
+                &chunk.text,
+            )
+            .await;
         } else {
             *committed_prefix = current_rendered;
+            *active_block = None;
+            active_turn.clear();
         }
-        *active_block = None;
-        active_turn.clear();
         publish_status(
             state,
             StatusUpdate {
@@ -979,6 +1003,50 @@ async fn apply_transcript(
     status.partial_transcript = Some(latest.to_string());
     status.updated_at = Utc::now();
     state.overlay.push(status.clone());
+}
+
+async fn apply_literal_fallback(
+    state: &Arc<AppState>,
+    keyboard: &mut UInputKeyboard,
+    committed_prefix: &mut String,
+    active_block: &mut Option<FormattingBlock>,
+    active_turn: &mut String,
+    previous_rendered: &str,
+    literal_text: &str,
+) {
+    let next_rendered =
+        render_literal_fallback(committed_prefix, active_block.as_ref(), literal_text);
+    copy_final_literal_transcript(
+        state,
+        normalized_literal_clipboard_text(literal_text).as_deref(),
+    );
+    apply_transcript(state, keyboard, previous_rendered, &next_rendered).await;
+    *committed_prefix = next_rendered;
+    *active_block = None;
+    active_turn.clear();
+}
+
+fn copy_final_literal_transcript(state: &Arc<AppState>, text: Option<&str>) {
+    let Some(text) = text else {
+        return;
+    };
+
+    if let Err(error) = state.overlay.copy_text(text) {
+        warn!("failed to copy literal transcript to clipboard: {error}");
+    }
+}
+
+fn clipboard_text_for_decision(decision: &wispr_core::SegmentDecision) -> Option<String> {
+    if decision.kind == DecisionKind::Literal {
+        normalized_literal_clipboard_text(&decision.text_to_emit)
+    } else {
+        None
+    }
+}
+
+fn normalized_literal_clipboard_text(text: &str) -> Option<String> {
+    let rendered = append_block("", text, &FormatKind::Plain);
+    (!rendered.is_empty()).then_some(rendered)
 }
 
 async fn stop_dictation(state: Arc<AppState>) -> Result<String> {
@@ -1182,12 +1250,17 @@ async fn finalize_unresolved_turn(
     }
 
     let previous_rendered = render_transcript(committed_prefix, active_block.as_ref(), active_turn);
-    let next_rendered =
-        render_literal_fallback(committed_prefix, active_block.as_ref(), active_turn);
-    apply_transcript(state, keyboard, &previous_rendered, &next_rendered).await;
-    *committed_prefix = next_rendered;
-    *active_block = None;
-    active_turn.clear();
+    let literal_text = active_turn.clone();
+    apply_literal_fallback(
+        state,
+        keyboard,
+        committed_prefix,
+        active_block,
+        active_turn,
+        &previous_rendered,
+        &literal_text,
+    )
+    .await;
 }
 
 fn render_transcript(
@@ -1403,5 +1476,65 @@ fn active_transcription_label(config: &AppConfig) -> String {
     match &config.transcription.provider {
         TranscriptionProvider::Deepgram => "Listening (cloud)".to_string(),
         TranscriptionProvider::WhisperLocal => "Listening (local)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wispr_core::{ActionType, RewriteScope, SegmentDecision};
+
+    fn decision_with_kind(kind: DecisionKind, text: &str) -> SegmentDecision {
+        SegmentDecision {
+            kind,
+            rewrite_scope: RewriteScope::Segment,
+            format_kind: FormatKind::Plain,
+            text_to_emit: text.to_string(),
+            keep_block_open: false,
+            actions: Vec::new(),
+            generation_prompt: None,
+            generation_style: None,
+            replace_current_segment: false,
+        }
+    }
+
+    #[test]
+    fn clipboard_copy_is_limited_to_pure_literal_decisions() {
+        let literal = SegmentDecision::literal("hello world");
+        let action = decision_with_kind(DecisionKind::Action, "copy");
+        let literal_and_action = SegmentDecision {
+            actions: vec![wispr_core::ActionCommand {
+                action_type: ActionType::Key,
+                key: Some(wispr_core::ActionKey::Enter),
+                modifiers: Vec::new(),
+                repeat: 1,
+                command_id: None,
+                target_app: None,
+            }],
+            ..decision_with_kind(DecisionKind::LiteralAndAction, "hello")
+        };
+        let generation = decision_with_kind(DecisionKind::Generation, "");
+
+        assert_eq!(
+            clipboard_text_for_decision(&literal),
+            Some("hello world".to_string())
+        );
+        assert_eq!(clipboard_text_for_decision(&action), None);
+        assert_eq!(clipboard_text_for_decision(&literal_and_action), None);
+        assert_eq!(clipboard_text_for_decision(&generation), None);
+    }
+
+    #[test]
+    fn literal_fallback_clipboard_text_matches_segment_emission() {
+        let literal_text = "  pasted later  ";
+        let rendered_segment =
+            render_with_segment_decision("", None, literal_text, &FormatKind::Plain);
+        let rendered_with_prefix = render_literal_fallback("already there", None, literal_text);
+
+        assert_eq!(
+            normalized_literal_clipboard_text(literal_text),
+            Some(rendered_segment)
+        );
+        assert_eq!(rendered_with_prefix, "already there pasted later");
     }
 }

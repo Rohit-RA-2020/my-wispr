@@ -14,21 +14,32 @@ use wispr_core::models::{DaemonStatus, DictationState, TranscriptionProvider};
 #[derive(Clone)]
 pub struct OverlayHandle {
     sender: Sender<DaemonStatus>,
+    clipboard_sender: Sender<String>,
 }
 
 impl OverlayHandle {
     pub fn spawn() -> Self {
         let (sender, receiver) = mpsc::channel::<DaemonStatus>();
-        thread::spawn(move || run_overlay(receiver));
-        Self { sender }
+        let (clipboard_sender, clipboard_receiver) = mpsc::channel::<String>();
+        thread::spawn(move || run_overlay(receiver, clipboard_receiver));
+        Self {
+            sender,
+            clipboard_sender,
+        }
     }
 
     pub fn push(&self, status: DaemonStatus) {
         let _ = self.sender.send(status);
     }
+
+    pub fn copy_text(&self, text: &str) -> Result<(), String> {
+        self.clipboard_sender
+            .send(text.to_string())
+            .map_err(|err| err.to_string())
+    }
 }
 
-fn run_overlay(receiver: Receiver<DaemonStatus>) {
+fn run_overlay(receiver: Receiver<DaemonStatus>, clipboard_receiver: Receiver<String>) {
     if gtk::init().is_err() {
         return;
     }
@@ -36,6 +47,7 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
     install_overlay_css();
 
     let receiver = Arc::new(Mutex::new(receiver));
+    let clipboard_receiver = Arc::new(Mutex::new(clipboard_receiver));
     let window = gtk::Window::builder()
         .title("Wispr Overlay")
         .default_width(340)
@@ -121,23 +133,29 @@ fn run_overlay(receiver: Receiver<DaemonStatus>) {
     window.set_child(Some(&shell));
 
     attach_drag_controller(&window, &card);
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let clipboard = display.clipboard();
 
     let live_window = window.clone();
     glib::timeout_add_local(Duration::from_millis(60), move || {
-        let Some(status) = latest_status(&receiver) else {
-            return ControlFlow::Continue;
-        };
+        if let Some(text) = latest_clipboard_text(&clipboard_receiver) {
+            clipboard.set_text(&text);
+        }
 
-        apply_overlay_status(
-            &live_window,
-            &card,
-            &indicator,
-            &title_label,
-            &message_label,
-            &provider_badge,
-            &detail_label,
-            status,
-        );
+        if let Some(status) = latest_status(&receiver) {
+            apply_overlay_status(
+                &live_window,
+                &card,
+                &indicator,
+                &title_label,
+                &message_label,
+                &provider_badge,
+                &detail_label,
+                status,
+            );
+        }
 
         ControlFlow::Continue
     });
@@ -180,6 +198,18 @@ fn latest_status(receiver: &Arc<Mutex<Receiver<DaemonStatus>>>) -> Option<Daemon
     let mut latest = None;
     while let Ok(status) = rx.try_recv() {
         latest = Some(status);
+    }
+    latest
+}
+
+fn latest_clipboard_text(receiver: &Arc<Mutex<Receiver<String>>>) -> Option<String> {
+    let Ok(rx) = receiver.lock() else {
+        return None;
+    };
+
+    let mut latest = None;
+    while let Ok(text) = rx.try_recv() {
+        latest = Some(text);
     }
     latest
 }

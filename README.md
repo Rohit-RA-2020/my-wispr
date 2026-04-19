@@ -18,6 +18,7 @@ This repository currently targets Ubuntu GNOME on Wayland.
 - transcription can run either through Deepgram streaming or through local Whisper turn-by-turn transcription
 - local Whisper is English-only in v1, does not emit live partials, and manages models under `~/.local/share/wispr/whisper`
 - finalized transcript segments can be passed through an OpenAI-compatible `responses` backend for structured command interpretation
+- finalized literal transcript segments also replace the desktop clipboard so they can still be pasted if no text field was focused
 - the LLM layer supports literal dictation, editing actions, semantic commands, block formatting, autonomous writing mode, and literal text plus actions in the same spoken segment
 
 ## Capabilities
